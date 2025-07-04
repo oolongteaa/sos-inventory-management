@@ -12,8 +12,8 @@ from SOSInventoryIntegration import SOSInventoryAPI
 from SOSInventoryIntegration import SOSAuth
 
 # Google Sheets Configuration
-GOOGLE_CREDENTIALS_FILE = "your-credentials.json"  # Replace with your JSON file path
-GOOGLE_SHEET_ID = "your-sheet-id"  # Replace with your Google Sheet ID
+GOOGLE_CREDENTIALS_FILE = "cogent-scion-463416-v2-ae77628bbccc.json"  # Replace with your JSON file path
+GOOGLE_SHEET_ID = "15EVhfeVlxirHSYZdtqRjrqmhOFE93pW0EeqQxw4nKDE"  # Replace with your Google Sheet ID
 
 # Monitoring Configuration
 CHECK_INTERVAL = 10  # seconds between sheet checks
