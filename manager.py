@@ -8,8 +8,8 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import time
 import hashlib
-from SOSInventoryIntegration import SOSInventoryAPI
-from SOSInventoryIntegration import SOSAuth
+from sos_inventory_integration import sos_api
+from sos_inventory_integration import sos_auth
 
 # Google Sheets Configuration
 GOOGLE_CREDENTIALS_FILE = "cogent-scion-463416-v2-ae77628bbccc.json"  # Replace with your JSON file path
