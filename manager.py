@@ -52,12 +52,12 @@ def setup_sos_inventory():
     print_separator("SOS INVENTORY AUTHENTICATION")
     print("Setting up SOS Inventory API access...")
 
-    if SOSAuth.authenticate():
-        _sos_access_token = SOSAuth.get_access_token()
+    if sos_auth.authenticate():
+        _sos_access_token = sos_auth.get_access_token()
         print("SUCCESS: SOS Inventory authentication successful!")
 
         # Test the connection
-        success, result = SOSInventoryAPI.test_connection(_sos_access_token)
+        success, result = sos_api.test_connection(_sos_access_token)
         if success:
             print("SUCCESS: SOS Inventory API connection verified")
             return True
@@ -171,7 +171,7 @@ def test_sos_inventory_for_row(row_data):
     try:
         # Test API with Get items (limit to 3 for testing)
         print("  Testing get_items()...")
-        success, items = SOSInventoryAPI.get_items(_sos_access_token, params={"limit": 3})
+        success, items = sos_api.get_items(_sos_access_token, params={"limit": 3})
         if success:
             item_count = len(items.get('data', []))
             print(f"    SUCCESS: Retrieved {item_count} items")
