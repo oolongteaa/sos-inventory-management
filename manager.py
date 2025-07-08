@@ -7,7 +7,7 @@ available item from the inventory to any found sales orders (or increases quanti
 """
 
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 import time
 import hashlib
 from datetime import datetime
@@ -77,6 +77,50 @@ def build_search_string(column_b_value):
     return search_string
 
 
+def ensure_valid_sos_token():
+    """Ensure we have a valid SOS access token, refresh if needed"""
+    global _sos_access_token
+
+    print("[TOKEN DEBUG] Checking SOS token validity...")
+
+    # If we don't have a token at all, get one
+    if not _sos_access_token:
+        print("[TOKEN DEBUG] No token found, authenticating...")
+        if sos_auth.authenticate():
+            _sos_access_token = sos_auth.get_access_token()
+            print("[TOKEN DEBUG] Initial authentication successful ✓")
+            return True
+        else:
+            print("[TOKEN ERROR] Initial authentication failed")
+            return False
+
+    # Test the current token with a simple API call
+    success, result = sos_api.test_connection(_sos_access_token)
+    if success:
+        print("[TOKEN DEBUG] Current token is valid ✓")
+        return True
+    else:
+        print("[TOKEN DEBUG] Token expired/invalid, refreshing...")
+
+        # Try to refresh the token
+        if hasattr(sos_auth, 'refresh_access_token'):
+            refresh_success, refresh_result = sos_auth.refresh_access_token()
+            if refresh_success:
+                _sos_access_token = sos_auth.get_access_token()
+                print("[TOKEN DEBUG] Token refreshed successfully ✓")
+                return True
+
+        # If refresh failed or not available, re-authenticate
+        print("[TOKEN DEBUG] Attempting full re-authentication...")
+        if sos_auth.authenticate():
+            _sos_access_token = sos_auth.get_access_token()
+            print("[TOKEN DEBUG] Re-authentication successful ✓")
+            return True
+        else:
+            print("[TOKEN ERROR] Re-authentication failed")
+            return False
+
+
 def get_first_inventory_item():
     """
     Get the first available inventory item
@@ -94,6 +138,10 @@ def get_first_inventory_item():
 
     try:
         print(f"    [DEBUG] Getting all items from inventory...")
+
+        # Ensure we have a valid token
+        if not ensure_valid_sos_token():
+            return False, "Failed to obtain valid SOS access token"
 
         # Get items with a reasonable limit
         success, result = sos_api.get_items(_sos_access_token, params={"maxresults": 50})
@@ -144,7 +192,7 @@ def setup_google_sheets():
     global _sheet_instance
     try:
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_FILE, scope)
+        creds = Credentials.from_service_account_file(GOOGLE_CREDENTIALS_FILE, scopes=scope)
         client = gspread.authorize(creds)
         sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
         _sheet_instance = sheet
@@ -221,31 +269,30 @@ def setup_sos_inventory():
     print_separator("SOS INVENTORY AUTHENTICATION")
     print("Setting up SOS Inventory API access...")
 
-    if sos_auth.authenticate():
-        _sos_access_token = sos_auth.get_access_token()
-        print("SUCCESS: SOS Inventory authentication successful!")
-
-        # Test the connection using the new API
-        success, result = sos_api.test_connection(_sos_access_token)
-        if success:
-            print("SUCCESS: SOS Inventory API connection verified")
-
-            # Get and cache the first item for later use
-            print("Getting first inventory item...")
-            item_success, item_result = get_first_inventory_item()
-            if item_success:
-                first_item = item_result
-                print(
-                    f"SUCCESS: First inventory item loaded - ID: {first_item.get('id')}, Name: {first_item.get('name')}")
-            else:
-                print(f"WARNING: Could not get first inventory item: {item_result}")
-
-            return True
-        else:
-            print(f"ERROR: SOS Inventory API test failed: {result}")
-            return False
-    else:
+    if not ensure_valid_sos_token():
         print("ERROR: SOS Inventory authentication failed")
+        return False
+
+    print("SUCCESS: SOS Inventory authentication successful!")
+
+    # Test the connection
+    success, result = sos_api.test_connection(_sos_access_token)
+    if success:
+        print("SUCCESS: SOS Inventory API connection verified")
+
+        # Get and cache the first item for later use
+        print("Getting first inventory item...")
+        item_success, item_result = get_first_inventory_item()
+        if item_success:
+            first_item = item_result
+            print(
+                f"SUCCESS: First inventory item loaded - ID: {first_item.get('id')}, Name: {first_item.get('name')}")
+        else:
+            print(f"WARNING: Could not get first inventory item: {item_result}")
+
+        return True
+    else:
+        print(f"ERROR: SOS Inventory API test failed: {result}")
         return False
 
 
@@ -387,6 +434,10 @@ def add_or_update_item_in_sales_order(sales_order_id, item_id, item_name, quanti
         print(f"      - item_name: {item_name}")
         print(f"      - quantity_to_add: {quantity_to_add} (type: {type(quantity_to_add)})")
 
+        # Ensure we have a valid token before proceeding
+        if not ensure_valid_sos_token():
+            return False, "Failed to obtain valid SOS authentication token"
+
         # Use the API function that handles the complete GET/PUT process
         success, result = sos_api.add_or_update_item_in_sales_order(
             sales_order_id, item_id, quantity_to_add, _sos_access_token
@@ -420,6 +471,7 @@ def add_or_update_item_in_sales_order(sales_order_id, item_id, item_name, quanti
     except Exception as e:
         print(f"    Exception while processing sales order: {str(e)}")
         return False, f"Exception while adding/updating item: {str(e)}"
+
 
 def process_completed_row(row_data):
     """Process a newly completed row by searching SOS Inventory sales orders and adding first item"""
@@ -490,9 +542,9 @@ def search_and_update_sales_orders(row_data, search_string):
     print(f"Searching SOS Inventory sales orders for row {row_data['row_number']}...")
 
     try:
-        # Check if we have a valid access token
-        if not _sos_access_token:
-            print("  ERROR: No SOS Inventory access token available")
+        # Ensure we have a valid access token
+        if not ensure_valid_sos_token():
+            print("  ERROR: Failed to obtain valid SOS Inventory access token")
             return False, "No access token"
 
         # Get the first inventory item to add
@@ -642,7 +694,8 @@ def monitor_sheet():
     print(f"Target item: {item_info}")
     print(f"Default quantity: {DEFAULT_QUANTITY}")
     print("Will search SOS Inventory sales orders and add/update first inventory item when new rows are completed")
-    print("Uses GET sales order → modify line items → PUT sales order approach")
+    print("Uses OAuth2 Bearer token authentication with automatic token refresh")
+    print("Uses GET sales order → modify lines → PUT sales order approach")
     print("Returns updated sales order object for verification")
     print("SUCCESS: Rows will be colored light blue")
     print("FAILURE: Rows will be colored light red")
@@ -702,7 +755,6 @@ def monitor_sheet():
         return False
 
 
-
 def main():
     """Main function"""
     current_month = get_current_month_name()
@@ -710,7 +762,7 @@ def main():
     print("Google Sheets to SOS Inventory Integration (Sales Order Search + First Item Addition)")
     print("This will monitor your Google Sheet, search SOS Inventory sales orders,")
     print(f"and add the first inventory item to found orders (or increase quantity by {DEFAULT_QUANTITY})")
-    print("Uses GET → modify → PUT approach with updated sales order object returned")
+    print("Uses OAuth2 Bearer token authentication with GET → modify → PUT approach")
 
     print_separator("CONFIGURATION")
     print(f"Google Credentials: {GOOGLE_CREDENTIALS_FILE}")
@@ -724,7 +776,11 @@ def main():
     print("Mode: Sales Order Search + First Item Addition via GET/PUT")
     print("Search Pattern: [Column B] + [Current Month]")
     print("Item Action: Add first inventory item or increase existing quantity by 1")
-    print("Method: GET sales order → modify lineItems → PUT sales order → verify result")
+    print("Method: GET sales order → modify lines → PUT sales order → verify result")
+    print("Authentication: OAuth2 Bearer token with automatic refresh")
+    print("API Base URL: https://api.sosinventory.com/api/v2/")
+    print("Authorization Header: Bearer {access_token}")
+    print("Host Header: api.sosinventory.com")
     print("Color coding:")
     print("  - Light blue: Successful sales order search and item addition")
     print("  - Light red: Errors (SOS API failure, invalid data, no orders found, etc.)")
