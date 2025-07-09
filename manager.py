@@ -2,8 +2,8 @@
 """
 Google Sheets to SOS Inventory Integration
 Monitors a Google Sheet for completed rows, searches SOS Inventory sales orders
-using Column B value + current month (e.g., "HA 101 July"), and adds the first
-available item from the inventory to any found sales orders (or increases quantity by 1 if it already exists)
+using Column B value + current month (e.g., "HA 101 July"), and adds items from
+the spreadsheet based on item IDs in row 1 and quantities in the processed row
 """
 
 import gspread
@@ -13,18 +13,22 @@ import hashlib
 from datetime import datetime
 from sos_inventory_integration import sos_api
 from sos_inventory_integration import sos_auth
+import pandas as pd
 
 # Google Sheets Configuration
 GOOGLE_CREDENTIALS_FILE = "cogent-scion-463416-v2-ae77628bbccc.json"  # Replace with your JSON file path
 GOOGLE_SHEET_ID = "15EVhfeVlxirHSYZdtqRjrqmhOFE93pW0EeqQxw4nKDE"  # Replace with your Google Sheet ID
 
-# SOS Inventory Configuration
-DEFAULT_QUANTITY = 1  # Quantity to add if item doesn't exist in order
 
 # Monitoring Configuration
 CHECK_INTERVAL = 10  # seconds between sheet checks
 DONE_COLUMN_NAME = "Done?"  # case-insensitive column name to monitor
 SEARCH_COLUMN = "B"  # Column B contains the search string for sales orders
+
+# Row configuration for spreadsheet structure
+ITEM_ID_ROW = 0  # Row 1 (0-indexed) contains item IDs
+ITEM_NAME_ROW = 1  # Row 2 (1-indexed) contains item names
+DATA_START_ROW = 2  # Row 3+ (2-indexed) contain order data
 
 # Color Configuration
 SUCCESS_COLOR = {
@@ -43,7 +47,7 @@ ERROR_COLOR = {
 _sos_access_token = None
 _previous_completed_rows = None
 _sheet_instance = None
-_first_item_cache = None  # Cache the first item to avoid repeated API calls
+_sheet_data_cache = None  # Cache sheet data to extract item IDs and names
 
 
 def print_separator(title=""):
@@ -121,70 +125,85 @@ def ensure_valid_sos_token():
             return False
 
 
-def get_first_inventory_item():
+def extract_items_from_sheet_data(sheet_data, row_data):
     """
-    Get the first available inventory item
+    Extract items and quantities from sheet data based on the processed row
+
+    Parameters:
+    - sheet_data: All sheet data (list of lists)
+    - row_data: The specific row being processed
 
     Returns:
-    - Tuple (success: bool, item_data: dict or error_message: str)
+    - List of dictionaries with item_id, quantity, and name
     """
-    global _first_item_cache
-
-    # Return cached item if we already have one
-    if _first_item_cache:
-        print(
-            f"    [DEBUG] Using cached first item: ID={_first_item_cache.get('id')}, Name={_first_item_cache.get('name')}")
-        return True, _first_item_cache
-
     try:
-        print(f"    [DEBUG] Getting all items from inventory...")
+        if not sheet_data or len(sheet_data) < DATA_START_ROW + 1:
+            print("ERROR: Sheet data insufficient - need at least 3 rows")
+            return []
 
-        # Ensure we have a valid token
-        if not ensure_valid_sos_token():
-            return False, "Failed to obtain valid SOS access token"
+        # Get item IDs from row 1 (index 0)
+        item_ids = sheet_data[ITEM_ID_ROW] if len(sheet_data) > ITEM_ID_ROW else []
 
-        # Get items with a reasonable limit
-        success, result = sos_api.get_items(_sos_access_token, params={"maxresults": 50})
+        # Get item names from row 2 (index 1)
+        item_names = sheet_data[ITEM_NAME_ROW] if len(sheet_data) > ITEM_NAME_ROW else []
 
-        if not success:
-            print(f"    [ERROR] Failed to get items: {result}")
-            return False, f"Failed to get items: {result}"
+        # Get quantities from the current row data
+        quantities = row_data.get('data', [])
 
-        # Parse the response
-        items = result.get("data", [])
-        total_count = result.get("totalCount", 0)
+        print(f"    [DEBUG] Processing items from sheet:")
+        print(f"      Item IDs row: {len(item_ids)} columns")
+        print(f"      Item names row: {len(item_names)} columns")
+        print(f"      Current row data: {len(quantities)} columns")
 
-        print(f"    [DEBUG] Retrieved {len(items)} items (total available: {total_count})")
+        items_to_add = []
 
-        if not items:
-            return False, "No items found in inventory"
+        # Start from column index that corresponds to inventory items
+        # Skip the first few columns that contain metadata (timestamp, unit, customer, etc.)
+        start_column = 3  # Adjust based on your sheet structure
 
-        # Log the first few items for debugging
-        print(f"    [DEBUG] First 5 items:")
-        for i, item in enumerate(items[:5]):
-            item_id = item.get('id')
-            item_name = item.get('name', 'Unknown')
-            item_sku = item.get('sku', 'No SKU')
-            item_type = item.get('type', 'Unknown Type')
-            print(f"      {i + 1}. ID: {item_id}, Name: {item_name}, SKU: {item_sku}, Type: {item_type}")
+        for col_index in range(start_column, len(quantities)):
+            # Get quantity from current row
+            quantity_value = quantities[col_index] if col_index < len(quantities) else None
 
-        # Use the first item
-        first_item = items[0]
-        first_item_id = first_item.get('id')
-        first_item_name = first_item.get('name', 'Unknown')
+            # Skip if no quantity or invalid quantity
+            if not quantity_value or quantity_value == '' or quantity_value == 0:
+                continue
 
-        if not first_item_id:
-            return False, "First item has no ID"
+            try:
+                quantity = float(quantity_value)
+                if quantity <= 0:
+                    continue
+            except (ValueError, TypeError):
+                print(f"      Warning: Invalid quantity '{quantity_value}' in column {col_index}")
+                continue
 
-        # Cache the first item for future use
-        _first_item_cache = first_item
+            # Get corresponding item ID and name
+            item_id = item_ids[col_index] if col_index < len(item_ids) else None
+            item_name = item_names[col_index] if col_index < len(item_names) else None
 
-        print(f"    [DEBUG] Selected first item: ID={first_item_id}, Name={first_item_name}")
-        return True, first_item
+            # Skip if no item ID
+            if not item_id or item_id == '':
+                continue
+
+            # Clean up the data
+            item_id_clean = str(item_id).strip()
+            item_name_clean = str(item_name).strip() if item_name else f"Item {item_id_clean}"
+
+            items_to_add.append({
+                "item_id": item_id_clean,
+                "quantity": quantity,
+                "name": item_name_clean,
+                "column": col_index
+            })
+
+            print(f"      Found: {item_name_clean} (ID: {item_id_clean}) - Qty: {quantity}")
+
+        print(f"    [DEBUG] Total items to add: {len(items_to_add)}")
+        return items_to_add
 
     except Exception as e:
-        print(f"    [ERROR] Exception while getting items: {str(e)}")
-        return False, f"Exception while getting items: {str(e)}"
+        print(f"ERROR: Exception extracting items from sheet: {str(e)}")
+        return []
 
 
 def setup_google_sheets():
@@ -279,17 +298,6 @@ def setup_sos_inventory():
     success, result = sos_api.test_connection(_sos_access_token)
     if success:
         print("SUCCESS: SOS Inventory API connection verified")
-
-        # Get and cache the first item for later use
-        print("Getting first inventory item...")
-        item_success, item_result = get_first_inventory_item()
-        if item_success:
-            first_item = item_result
-            print(
-                f"SUCCESS: First inventory item loaded - ID: {first_item.get('id')}, Name: {first_item.get('name')}")
-        else:
-            print(f"WARNING: Could not get first inventory item: {item_result}")
-
         return True
     else:
         print(f"ERROR: SOS Inventory API test failed: {result}")
@@ -298,8 +306,10 @@ def setup_sos_inventory():
 
 def fetch_sheet_data(sheet):
     """Fetch all sheet data and compute a hash for change detection"""
+    global _sheet_data_cache
     try:
         data = sheet.get_all_values()
+        _sheet_data_cache = data  # Cache the data for item extraction
         flat_data = "".join([",".join(row) for row in data])
         data_hash = hashlib.md5(flat_data.encode()).hexdigest()
         return data_hash, data
@@ -413,69 +423,52 @@ def validate_row_data(row_data):
         return False
 
 
-def add_or_update_item_in_sales_order(sales_order_id, item_id, item_name, quantity_to_add=1):
+def add_items_to_sales_order(sales_order_id, items_to_add):
     """
-    Add item to sales order or increase quantity if it already exists using GET/PUT approach
+    Add multiple items to sales order using the new API function
 
     Parameters:
     - sales_order_id: ID of the sales order
-    - item_id: ID of the item to add/update
-    - item_name: Name of the item (for logging)
-    - quantity_to_add: Quantity to add (default: 1)
+    - items_to_add: List of item dictionaries from extract_items_from_sheet_data
 
     Returns:
     - Tuple (success: bool, message: str)
     """
     try:
-        print(f"    [DEBUG] Starting add_or_update_item_in_sales_order")
-        print(f"    [DEBUG] Input parameters:")
-        print(f"      - sales_order_id: {sales_order_id} (type: {type(sales_order_id)})")
-        print(f"      - item_id: {item_id} (type: {type(item_id)})")
-        print(f"      - item_name: {item_name}")
-        print(f"      - quantity_to_add: {quantity_to_add} (type: {type(quantity_to_add)})")
+        print(f"    [DEBUG] Adding {len(items_to_add)} items to sales order {sales_order_id}")
 
         # Ensure we have a valid token before proceeding
         if not ensure_valid_sos_token():
             return False, "Failed to obtain valid SOS authentication token"
 
-        # Use the API function that handles the complete GET/PUT process
-        success, result = sos_api.add_or_update_item_in_sales_order(
-            sales_order_id, item_id, quantity_to_add, _sos_access_token
+        # Use the new API function that handles multiple items
+        success, result = sos_api.add_multiple_items_to_sales_order(
+            sales_order_id, items_to_add, _sos_access_token
         )
 
         if success:
-            # The result is the updated sales order object
-            updated_order = result
-            order_number = updated_order.get('number', 'Unknown')
-            lines = updated_order.get('lines', [])  # Use 'lines' not 'lineItems'
+            # Extract update statistics
+            items_added = result.get("items_added", 0)
+            items_updated = result.get("items_updated", 0)
+            total_processed = result.get("total_processed", 0)
 
-            # Find our item in the updated lines to report the final quantity
-            target_item_quantity = None
-            for line in lines:
-                item_info = line.get('item', {})
-                if isinstance(item_info, dict) and str(item_info.get('id')) == str(item_id):
-                    target_item_quantity = line.get('quantity', 0)
-                    break
+            print(f"    Successfully processed {total_processed} items:")
+            print(f"      - New items added: {items_added}")
+            print(f"      - Existing items updated: {items_updated}")
 
-            if target_item_quantity is not None:
-                print(f"    Sales order {order_number} updated successfully")
-                print(f"    Item '{item_name}' (ID: {item_id}) now has quantity: {target_item_quantity}")
-                return True, f"Successfully updated order {order_number} - item '{item_name}' (ID: {item_id}) quantity: {target_item_quantity}"
-            else:
-                print(f"    Sales order {order_number} updated but could not verify item quantity")
-                return True, f"Successfully updated order {order_number} - item '{item_name}' (ID: {item_id}) added/updated"
+            return True, f"Processed {total_processed} items ({items_added} new, {items_updated} updated)"
         else:
-            print(f"    Failed to update sales order: {result}")
+            print(f"    Failed to add items to sales order: {result}")
             return False, result
 
     except Exception as e:
         print(f"    Exception while processing sales order: {str(e)}")
-        return False, f"Exception while adding/updating item: {str(e)}"
+        return False, f"Exception while adding items: {str(e)}"
 
 
 def process_completed_row(row_data):
-    """Process a newly completed row by searching SOS Inventory sales orders and adding first item"""
-    global _sheet_instance
+    """Process a newly completed row by searching SOS Inventory sales orders and adding items from spreadsheet"""
+    global _sheet_instance, _sheet_data_cache
 
     print(f"\nProcessing Row {row_data['row_number']}:")
 
@@ -510,8 +503,19 @@ def process_completed_row(row_data):
                 print(f"Current month: '{current_month}'")
                 print(f"Full search string: '{search_string}'")
 
-                # Search SOS Inventory for sales orders and add first item
-                success, error_reason = search_and_update_sales_orders(row_data, search_string)
+                # Extract items from the sheet data
+                if not _sheet_data_cache:
+                    error_reason = "No sheet data available for item extraction"
+                    success = False
+                else:
+                    items_to_add = extract_items_from_sheet_data(_sheet_data_cache, row_data)
+
+                    if not items_to_add:
+                        error_reason = "No items found to add from this row"
+                        success = False
+                    else:
+                        # Search SOS Inventory for sales orders and add items
+                        success, error_reason = search_and_update_sales_orders(row_data, search_string, items_to_add)
 
     except Exception as e:
         print(f"ERROR: Exception while processing row {row_data['row_number']}: {e}")
@@ -537,8 +541,8 @@ def process_completed_row(row_data):
     return success
 
 
-def search_and_update_sales_orders(row_data, search_string):
-    """Search SOS Inventory sales orders and add first inventory item to found orders"""
+def search_and_update_sales_orders(row_data, search_string, items_to_add):
+    """Search SOS Inventory sales orders and add items from spreadsheet to found orders"""
     print(f"Searching SOS Inventory sales orders for row {row_data['row_number']}...")
 
     try:
@@ -547,20 +551,9 @@ def search_and_update_sales_orders(row_data, search_string):
             print("  ERROR: Failed to obtain valid SOS Inventory access token")
             return False, "No access token"
 
-        # Get the first inventory item to add
-        print(f"  Getting first inventory item to add...")
-        item_success, item_result = get_first_inventory_item()
-
-        if not item_success:
-            print(f"  ERROR: Could not get first inventory item: {item_result}")
-            return False, f"Could not get inventory item: {item_result}"
-
-        first_item = item_result
-        target_item_id = first_item.get('id')
-        target_item_name = first_item.get('name', 'Unknown Item')
-        target_item_sku = first_item.get('sku', 'No SKU')
-
-        print(f"  Will add item: '{target_item_name}' (ID: {target_item_id}, SKU: {target_item_sku})")
+        print(f"  Items to add: {len(items_to_add)}")
+        for item in items_to_add:
+            print(f"    - {item['name']} (ID: {item['item_id']}) x {item['quantity']}")
 
         # Search for sales orders containing the search string
         print(f"  Searching sales orders containing: '{search_string}'...")
@@ -605,8 +598,8 @@ def search_and_update_sales_orders(row_data, search_string):
         if total_count > len(orders):
             print(f"      (Total matches: {total_count}, showing first {len(orders)})")
 
-        # Process each found sales order - add the first inventory item
-        print(f"\n    Adding item '{target_item_name}' (ID: {target_item_id}) to found sales orders...")
+        # Process each found sales order - add the items from spreadsheet
+        print(f"\n    Adding {len(items_to_add)} items to found sales orders...")
 
         successful_updates = 0
         failed_updates = 0
@@ -623,10 +616,8 @@ def search_and_update_sales_orders(row_data, search_string):
 
             print(f"      Processing Order {i + 1} ({order_number}, ID: {order_id})...")
 
-            # Add or update the item in this sales order using the new API function
-            item_success, item_message = add_or_update_item_in_sales_order(
-                order_id, target_item_id, target_item_name, DEFAULT_QUANTITY
-            )
+            # Add items to this sales order
+            item_success, item_message = add_items_to_sales_order(order_id, items_to_add)
 
             if item_success:
                 print(f"        SUCCESS: {item_message}")
@@ -642,7 +633,7 @@ def search_and_update_sales_orders(row_data, search_string):
         print(f"      Successful updates: {successful_updates}")
         print(f"      Failed updates: {failed_updates}")
         print(f"      Total orders processed: {successful_updates + failed_updates}")
-        print(f"      Item added: '{target_item_name}' (ID: {target_item_id})")
+        print(f"      Items processed per order: {len(items_to_add)}")
 
         if update_details:
             print(f"    Update Details:")
@@ -678,12 +669,6 @@ def monitor_sheet():
 
     current_month = get_current_month_name()
 
-    # Display the item that will be added
-    if _first_item_cache:
-        item_info = f"'{_first_item_cache.get('name')}' (ID: {_first_item_cache.get('id')}, SKU: {_first_item_cache.get('sku', 'No SKU')})"
-    else:
-        item_info = "First available inventory item"
-
     print(f"\nStarting sheet monitoring...")
     print(f"Sheet ID: {GOOGLE_SHEET_ID}")
     print(f"Check interval: {CHECK_INTERVAL} seconds")
@@ -691,9 +676,8 @@ def monitor_sheet():
     print(f"Search column: {SEARCH_COLUMN}")
     print(f"Current month: {current_month}")
     print(f"Search format: '[Column B Value] {current_month}' (e.g., 'HA 101 {current_month}')")
-    print(f"Target item: {item_info}")
-    print(f"Default quantity: {DEFAULT_QUANTITY}")
-    print("Will search SOS Inventory sales orders and add/update first inventory item when new rows are completed")
+    print(f"Item processing: Extract from spreadsheet using item IDs in row 1")
+    print("Will search SOS Inventory sales orders and add items from spreadsheet when new rows are completed")
     print("Uses OAuth2 Bearer token authentication with automatic token refresh")
     print("Uses GET sales order → modify lines → PUT sales order approach")
     print("Returns updated sales order object for verification")
@@ -759,9 +743,9 @@ def main():
     """Main function"""
     current_month = get_current_month_name()
 
-    print("Google Sheets to SOS Inventory Integration (Sales Order Search + First Item Addition)")
+    print("Google Sheets to SOS Inventory Integration (Sales Order Search + Spreadsheet Item Addition)")
     print("This will monitor your Google Sheet, search SOS Inventory sales orders,")
-    print(f"and add the first inventory item to found orders (or increase quantity by {DEFAULT_QUANTITY})")
+    print("and add items from the spreadsheet based on item IDs and quantities")
     print("Uses OAuth2 Bearer token authentication with GET → modify → PUT approach")
 
     print_separator("CONFIGURATION")
@@ -770,12 +754,13 @@ def main():
     print(f"Monitoring Column: {DONE_COLUMN_NAME}")
     print(f"Search Column: {SEARCH_COLUMN}")
     print(f"Current Month: {current_month}")
-    print(f"Target Item: First available inventory item")
-    print(f"Default Quantity: {DEFAULT_QUANTITY}")
+    print(f"Item ID Row: {ITEM_ID_ROW + 1} (Row 1)")
+    print(f"Item Name Row: {ITEM_NAME_ROW + 1} (Row 2)")
+    print(f"Data Start Row: {DATA_START_ROW + 1} (Row 3+)")
     print(f"Check Interval: {CHECK_INTERVAL} seconds")
-    print("Mode: Sales Order Search + First Item Addition via GET/PUT")
+    print("Mode: Sales Order Search + Spreadsheet Item Addition via GET/PUT")
     print("Search Pattern: [Column B] + [Current Month]")
-    print("Item Action: Add first inventory item or increase existing quantity by 1")
+    print("Item Action: Add items from spreadsheet based on item IDs and quantities")
     print("Method: GET sales order → modify lines → PUT sales order → verify result")
     print("Authentication: OAuth2 Bearer token with automatic refresh")
     print("API Base URL: https://api.sosinventory.com/api/v2/")

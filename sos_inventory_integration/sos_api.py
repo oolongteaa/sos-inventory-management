@@ -4,6 +4,25 @@ import json
 API_BASE_URL = "https://api.sosinventory.com/api/v2"
 
 
+def get_items(access_token, params=None):
+    """
+    Get inventory items with pagination support
+
+    Parameters:
+    - access_token: Authentication token
+    - params: Optional query parameters dict, can include:
+        - start: Pagination cursor (default: 0)
+        - maxresults: Max results to return (default: 200, max: 200)
+        - query: Search string for name, sku, or description
+        - type: Item type filter
+        - starred: Filter by starred items (0 or 1)
+
+    Returns:
+    - Tuple (success: bool, result: dict or error_message: str)
+    """
+    return make_request("GET", "/item", access_token, params=params)
+
+
 def make_request(method, endpoint, access_token, data=None, params=None):
     if not access_token:
         return False, "No access token provided"
@@ -103,8 +122,93 @@ def add_or_update_item_in_sales_order(sales_order_id, item_id, quantity_to_add, 
         return False, f"Exception: {str(e)}"
 
 
-def get_items(access_token, params=None):
-    return make_request("GET", "/item", access_token, params=params)
+def add_multiple_items_to_sales_order(sales_order_id, items_to_add, access_token):
+    """
+    Add multiple items to a sales order based on Google Sheet data
+
+    Parameters:
+    - sales_order_id: ID of the sales order
+    - items_to_add: List of dictionaries with item_id, quantity, and optional name
+      Format: [{"item_id": "123", "quantity": 2, "name": "Item Name"}, ...]
+    - access_token: SOS API access token
+
+    Returns:
+    - Tuple (success: bool, result: dict or error_message: str)
+    """
+    try:
+        print(f"[API DEBUG] Adding {len(items_to_add)} items to sales order {sales_order_id}")
+
+        # Get current sales order
+        success, response = get_sales_order_by_id(sales_order_id, access_token)
+        if not success:
+            return False, f"Could not retrieve sales order: {response}"
+
+        # Extract the data portion
+        current_data = response.get("data", response)
+
+        # Get current lines
+        lines = current_data.get("lines", [])
+
+        items_added = 0
+        items_updated = 0
+
+        for item_data in items_to_add:
+            item_id = str(item_data.get("item_id", ""))
+            quantity = item_data.get("quantity", 0)
+            item_name = item_data.get("name", f"Item {item_id}")
+
+            if not item_id or quantity <= 0:
+                print(f"Skipping invalid item: {item_data}")
+                continue
+
+            # Find existing item or add new one
+            existing_line_index = None
+            for index, line in enumerate(lines):
+                item_info = line.get("item", {})
+                if isinstance(item_info, dict) and str(item_info.get("id")) == item_id:
+                    existing_line_index = index
+                    break
+
+            if existing_line_index is not None:
+                # Update existing line quantity
+                current_quantity = lines[existing_line_index].get("quantity", 0)
+                lines[existing_line_index]["quantity"] = current_quantity + quantity
+                print(
+                    f"Updated existing item {item_name} (ID: {item_id}): {current_quantity} -> {current_quantity + quantity}")
+                items_updated += 1
+            else:
+                # Add new line
+                next_line_number = max([line.get("lineNumber", 0) for line in lines], default=0) + 1
+                new_line = {
+                    "lineNumber": next_line_number,
+                    "item": {"id": item_id},
+                    "quantity": quantity,
+                    "unitprice": 0,
+                    "tax": {"taxable": False, "taxCode": None}
+                }
+                lines.append(new_line)
+                print(f"Added new item {item_name} (ID: {item_id}) with quantity: {quantity}")
+                items_added += 1
+
+        # Update the lines in current data
+        current_data["lines"] = lines
+
+        # Send update
+        success, result = update_sales_order(sales_order_id, current_data, access_token)
+
+        if success:
+            print(f"Successfully added {items_added} new items and updated {items_updated} existing items")
+            return True, {
+                "updated_order": result,
+                "items_added": items_added,
+                "items_updated": items_updated,
+                "total_processed": items_added + items_updated
+            }
+        else:
+            return False, result
+
+    except Exception as e:
+        return False, f"Exception: {str(e)}"
 
 
 def get_sales_orders(access_token, params=None):
