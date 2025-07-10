@@ -1,5 +1,4 @@
 import requests
-import json
 
 API_BASE_URL = "https://api.sosinventory.com/api/v2"
 

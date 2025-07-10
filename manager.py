@@ -13,7 +13,6 @@ import hashlib
 from datetime import datetime
 from sos_inventory_integration import sos_api
 from sos_inventory_integration import sos_auth
-import pandas as pd
 
 # Google Sheets Configuration
 GOOGLE_CREDENTIALS_FILE = "cogent-scion-463416-v2-ae77628bbccc.json"  # Replace with your JSON file path
