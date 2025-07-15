@@ -16,8 +16,8 @@ from sos_inventory_integration import sos_auth
 
 # Google Sheets Configuration
 GOOGLE_CREDENTIALS_FILE = "cogent-scion-463416-v2-ae77628bbccc.json"  # Replace with your JSON file path
-GOOGLE_SHEET_ID = "15EVhfeVlxirHSYZdtqRjrqmhOFE93pW0EeqQxw4nKDE"  # Replace with your Google Sheet ID
-
+GOOGLE_SHEET_ID = "1yTdPlHPi8Xa1tADpJFJZa6-1ZFnFBMydp3AdnGgKEZs"  # Replace with your Google Sheet ID
+WORKSHEET_INDEX = 0  # Use the first worksheet (0-indexed)
 
 # Monitoring Configuration
 CHECK_INTERVAL = 10  # seconds between sheet checks
@@ -27,7 +27,6 @@ SEARCH_COLUMN = "B"  # Column B contains the search string for sales orders
 # Row configuration for spreadsheet structure
 ITEM_ID_ROW = 0  # Row 1 (0-indexed) contains item IDs
 ITEM_NAME_ROW = 1  # Row 2 (1-indexed) contains item names
-DATA_START_ROW = 2  # Row 3+ (2-indexed) contain order data
 
 # Color Configuration
 SUCCESS_COLOR = {
@@ -47,6 +46,8 @@ _sos_access_token = None
 _previous_completed_rows = None
 _sheet_instance = None
 _sheet_data_cache = None  # Cache sheet data to extract item IDs and names
+_processed_rows_cache = set()  # Track processed rows to avoid duplicates
+_done_column_info = None  # Store Done? column location
 
 
 def print_separator(title=""):
@@ -78,6 +79,42 @@ def build_search_string(column_b_value):
     search_string = f"{column_b_value.strip()} {current_month}"
 
     return search_string
+
+
+def find_done_column(data):
+    """
+    Find the 'Done?' column in any row of the sheet
+
+    Parameters:
+    - data: All sheet data (list of lists)
+
+    Returns:
+    - Dictionary with 'row', 'column', and 'found' keys
+    """
+    global _done_column_info
+
+    if not data:
+        return {'found': False, 'row': None, 'column': None}
+
+    print("    [DEBUG] Searching for 'Done?' column...")
+
+    # Search through all rows to find "Done?"
+    for row_index, row in enumerate(data):
+        for col_index, cell_value in enumerate(row):
+            if cell_value and cell_value.strip().lower() == DONE_COLUMN_NAME.lower():
+                _done_column_info = {
+                    'found': True,
+                    'row': row_index,
+                    'column': col_index,
+                    'row_number': row_index + 1,  # 1-indexed for display
+                    'column_letter': chr(65 + col_index)  # Convert to A, B, C, etc.
+                }
+                print(
+                    f"    [DEBUG] Found 'Done?' in row {row_index + 1}, column {chr(65 + col_index)} (index {col_index})")
+                return _done_column_info
+
+    print(f"    [DEBUG] 'Done?' column not found in sheet")
+    return {'found': False, 'row': None, 'column': None}
 
 
 def ensure_valid_sos_token():
@@ -136,7 +173,7 @@ def extract_items_from_sheet_data(sheet_data, row_data):
     - List of dictionaries with item_id, quantity, and name
     """
     try:
-        if not sheet_data or len(sheet_data) < DATA_START_ROW + 1:
+        if not sheet_data or len(sheet_data) < 3:
             print("ERROR: Sheet data insufficient - need at least 3 rows")
             return []
 
@@ -206,18 +243,65 @@ def extract_items_from_sheet_data(sheet_data, row_data):
 
 
 def setup_google_sheets():
-    """Setup Google Sheets API access"""
+    """Setup Google Sheets API access and target the first worksheet"""
     global _sheet_instance
     try:
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         creds = Credentials.from_service_account_file(GOOGLE_CREDENTIALS_FILE, scopes=scope)
         client = gspread.authorize(creds)
-        sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
+
+        # Open the spreadsheet by key
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+
+        # Get all worksheets to show available options
+        worksheets = spreadsheet.worksheets()
+        print(f"Found {len(worksheets)} worksheet(s) in the spreadsheet:")
+        for i, ws in enumerate(worksheets):
+            print(f"  {i}: {ws.title} (ID: {ws.id})")
+
+        # Use the first worksheet (index 0)
+        if len(worksheets) > WORKSHEET_INDEX:
+            sheet = worksheets[WORKSHEET_INDEX]
+            print(f"Using worksheet: '{sheet.title}' (index {WORKSHEET_INDEX})")
+        else:
+            print(f"ERROR: Worksheet index {WORKSHEET_INDEX} not found")
+            return None
+
         _sheet_instance = sheet
         print("SUCCESS: Google Sheets connection established")
+
+        # Test the connection by getting basic info
+        try:
+            row_count = sheet.row_count
+            col_count = sheet.col_count
+            print(f"Worksheet dimensions: {row_count} rows x {col_count} columns")
+        except Exception as e:
+            print(f"WARNING: Could not get worksheet dimensions: {e}")
+
         return sheet
     except Exception as e:
         print(f"ERROR: Failed to setup Google Sheets: {e}")
+        return None
+
+
+def create_row_signature(row_data):
+    """Create a unique signature for a row to track if it's been processed"""
+    try:
+        # Use row number + first few columns as signature
+        data = row_data.get('data', [])
+        row_num = row_data.get('row_number', 0)
+
+        # Create signature from row number and key columns
+        signature_parts = [str(row_num)]
+
+        # Add first 5 columns to signature (adjust as needed)
+        for i in range(min(5, len(data))):
+            signature_parts.append(str(data[i]).strip())
+
+        signature = "|".join(signature_parts)
+        return hashlib.md5(signature.encode()).hexdigest()
+    except Exception as e:
+        print(f"ERROR: Could not create row signature: {e}")
         return None
 
 
@@ -307,10 +391,16 @@ def fetch_sheet_data(sheet):
     """Fetch all sheet data and compute a hash for change detection"""
     global _sheet_data_cache
     try:
+        # Get fresh data from the sheet
         data = sheet.get_all_values()
         _sheet_data_cache = data  # Cache the data for item extraction
-        flat_data = "".join([",".join(row) for row in data])
+
+        # Create hash for change detection - include timestamp for better detection
+        timestamp = str(int(time.time() * 1000))  # milliseconds
+        flat_data = "".join([",".join(row) for row in data]) + timestamp
         data_hash = hashlib.md5(flat_data.encode()).hexdigest()
+
+        print(f"    [DEBUG] Fetched {len(data)} rows from sheet")
         return data_hash, data
     except Exception as e:
         print(f"ERROR: Error fetching sheet data: {e}")
@@ -319,59 +409,85 @@ def fetch_sheet_data(sheet):
 
 def filter_completed_rows(data):
     """Filter rows where the 'Done?' column is 'Yes'"""
+    global _done_column_info
+
     if not data:
         return []
 
-    # Find the "Done?" column index
-    header_row = data[0]
-    done_column_index = None
-
-    for i, header in enumerate(header_row):
-        if header.strip().lower() == DONE_COLUMN_NAME.lower():
-            done_column_index = i
-            break
-
-    if done_column_index is None:
+    # Find the "Done?" column
+    done_info = find_done_column(data)
+    if not done_info['found']:
         print(f"WARNING: '{DONE_COLUMN_NAME}' column not found in the sheet")
         return []
 
+    done_column_index = done_info['column']
+    done_row_index = done_info['row']
+
+    print(f"    [DEBUG] Found 'Done?' at row {done_row_index + 1}, column {chr(65 + done_column_index)}")
+    print(
+        f"    [DEBUG] Looking for 'Yes' values in column {chr(65 + done_column_index)} below row {done_row_index + 1}")
+
     # Filter rows where "Done?" is "Yes" (case-insensitive)
+    # Only check rows BELOW the "Done?" header row
     completed_rows = []
     for row_index, row in enumerate(data):
-        if row_index == 0:  # Skip header row
+        # Skip rows at or above the "Done?" header row
+        if row_index <= done_row_index:
             continue
 
         # Check if the row has enough columns and if "Done?" is "Yes"
         if (len(row) > done_column_index and
                 row[done_column_index].strip().lower() == "yes"):
-            # Add row number for reference
+            # Add row number for reference (using the original header row for context)
             row_with_meta = {
-                'row_number': row_index + 1,
+                'row_number': row_index + 1,  # 1-indexed row number
                 'data': row,
-                'headers': header_row
+                'headers': data[0] if len(data) > 0 else [],  # Use first row as headers
+                'done_column_index': done_column_index
             }
             completed_rows.append(row_with_meta)
+            print(f"    [DEBUG] Found completed row {row_index + 1}: Done? = '{row[done_column_index]}'")
 
+    print(f"    [DEBUG] Found {len(completed_rows)} completed rows total")
     return completed_rows
 
 
 def get_new_completed_rows(current_completed, previous_completed):
-    """Compare completed rows to find new ones"""
+    """Compare completed rows to find new ones, avoiding duplicates"""
+    global _processed_rows_cache
+
     if previous_completed is None:
-        return []  # Don't process all rows on first run
+        # On first run, don't process existing completed rows
+        print("    [DEBUG] First run - not processing existing completed rows")
+        return []
 
-    # Convert to sets for comparison (using just the data part)
-    current_set = set(tuple(row['data']) for row in current_completed)
-    previous_set = set(tuple(row['data']) for row in previous_completed)
-
-    # Find rows that are in current but not in previous
-    new_data_tuples = current_set - previous_set
-
-    # Get the full row objects for new rows
     new_rows = []
+
     for row in current_completed:
-        if tuple(row['data']) in new_data_tuples:
+        # Create a signature for this row
+        signature = create_row_signature(row)
+        if not signature:
+            continue
+
+        # Check if we've already processed this row
+        if signature in _processed_rows_cache:
+            print(f"    [DEBUG] Row {row['row_number']} already processed (cached)")
+            continue
+
+        # Check if this row was in the previous set
+        row_was_previously_completed = False
+        if previous_completed:
+            for prev_row in previous_completed:
+                prev_signature = create_row_signature(prev_row)
+                if prev_signature == signature:
+                    row_was_previously_completed = True
+                    break
+
+        # If it wasn't previously completed, it's new
+        if not row_was_previously_completed:
             new_rows.append(row)
+            _processed_rows_cache.add(signature)
+            print(f"    [DEBUG] New completed row detected: {row['row_number']}")
 
     return new_rows
 
@@ -395,10 +511,6 @@ def validate_row_data(row_data):
     try:
         headers = row_data.get('headers', [])
         data = row_data.get('data', [])
-
-        if not headers:
-            print(f"ERROR: No headers found for row {row_data['row_number']}")
-            return False
 
         if not data:
             print(f"ERROR: No data found for row {row_data['row_number']}")
@@ -481,12 +593,13 @@ def process_completed_row(row_data):
             success = False
         else:
             # Display the row data
-            headers = row_data['headers']
             data = row_data['data']
+            headers = row_data.get('headers', [])
 
             print("Row contents:")
-            for i, (header, value) in enumerate(zip(headers, data)):
+            for i, value in enumerate(data):
                 if value.strip():  # Only show non-empty values
+                    header = headers[i] if i < len(headers) else f"Column {chr(65 + i)}"
                     print(f"  {header}: {value}")
 
             # Get the search string from column B + current month
@@ -670,8 +783,9 @@ def monitor_sheet():
 
     print(f"\nStarting sheet monitoring...")
     print(f"Sheet ID: {GOOGLE_SHEET_ID}")
+    print(f"Worksheet: '{sheet.title}' (index {WORKSHEET_INDEX})")
     print(f"Check interval: {CHECK_INTERVAL} seconds")
-    print(f"Monitoring column: '{DONE_COLUMN_NAME}'")
+    print(f"Monitoring column: '{DONE_COLUMN_NAME}' (will search entire sheet for this header)")
     print(f"Search column: {SEARCH_COLUMN}")
     print(f"Current month: {current_month}")
     print(f"Search format: '[Column B Value] {current_month}' (e.g., 'HA 101 {current_month}')")
@@ -682,6 +796,8 @@ def monitor_sheet():
     print("Returns updated sales order object for verification")
     print("SUCCESS: Rows will be colored light blue")
     print("FAILURE: Rows will be colored light red")
+    print("Handles new rows added to sheet dynamically")
+    print("Searches for 'Done?' header in any row, then looks for 'Yes' values below it")
     print("Press Ctrl+C to stop monitoring")
 
     prev_hash = None
@@ -746,16 +862,18 @@ def main():
     print("This will monitor your Google Sheet, search SOS Inventory sales orders,")
     print("and add items from the spreadsheet based on item IDs and quantities")
     print("Uses OAuth2 Bearer token authentication with GET → modify → PUT approach")
+    print("Handles new rows added dynamically and targets the first worksheet")
+    print("Searches for 'Done?' header anywhere in sheet, processes 'Yes' values below it")
 
     print_separator("CONFIGURATION")
     print(f"Google Credentials: {GOOGLE_CREDENTIALS_FILE}")
     print(f"Google Sheet ID: {GOOGLE_SHEET_ID}")
-    print(f"Monitoring Column: {DONE_COLUMN_NAME}")
+    print(f"Target Worksheet: First worksheet (index {WORKSHEET_INDEX})")
+    print(f"Monitoring Column: {DONE_COLUMN_NAME} (searches entire sheet for this header)")
     print(f"Search Column: {SEARCH_COLUMN}")
     print(f"Current Month: {current_month}")
     print(f"Item ID Row: {ITEM_ID_ROW + 1} (Row 1)")
     print(f"Item Name Row: {ITEM_NAME_ROW + 1} (Row 2)")
-    print(f"Data Start Row: {DATA_START_ROW + 1} (Row 3+)")
     print(f"Check Interval: {CHECK_INTERVAL} seconds")
     print("Mode: Sales Order Search + Spreadsheet Item Addition via GET/PUT")
     print("Search Pattern: [Column B] + [Current Month]")
@@ -765,6 +883,9 @@ def main():
     print("API Base URL: https://api.sosinventory.com/api/v2/")
     print("Authorization Header: Bearer {access_token}")
     print("Host Header: api.sosinventory.com")
+    print("New Row Handling: Automatically detects and processes new rows added to sheet")
+    print("Duplicate Prevention: Uses row signatures to avoid reprocessing")
+    print("Header Detection: Searches entire sheet for 'Done?' header, processes rows below it")
     print("Color coding:")
     print("  - Light blue: Successful sales order search and item addition")
     print("  - Light red: Errors (SOS API failure, invalid data, no orders found, etc.)")
