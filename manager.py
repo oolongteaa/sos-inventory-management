@@ -536,7 +536,7 @@ def validate_row_data(row_data):
 
 def add_items_to_sales_order(sales_order_id, items_to_add):
     """
-    Add multiple items to sales order using the new API function
+    Add multiple items to sales order using the API function with pricing
 
     Parameters:
     - sales_order_id: ID of the sales order
@@ -552,22 +552,45 @@ def add_items_to_sales_order(sales_order_id, items_to_add):
         if not ensure_valid_sos_token():
             return False, "Failed to obtain valid SOS authentication token"
 
-        # Use the new API function that handles multiple items
+        # Use the API function that handles multiple items with pricing
         success, result = sos_api.add_multiple_items_to_sales_order(
             sales_order_id, items_to_add, _sos_access_token
         )
 
         if success:
-            # Extract update statistics
+            # Extract update statistics including price and amount updates
             items_added = result.get("items_added", 0)
             items_updated = result.get("items_updated", 0)
+            prices_updated = result.get("prices_updated", 0)
+            amounts_updated = result.get("amounts_updated", 0)
             total_processed = result.get("total_processed", 0)
+            price_errors = result.get("price_errors", [])
 
             print(f"    Successfully processed {total_processed} items:")
             print(f"      - New items added: {items_added}")
             print(f"      - Existing items updated: {items_updated}")
 
-            return True, f"Processed {total_processed} items ({items_added} new, {items_updated} updated)"
+            if prices_updated > 0:
+                print(f"      - Prices updated: {prices_updated}")
+
+            if amounts_updated > 0:
+                print(f"      - Line amounts updated: {amounts_updated}")
+
+            if price_errors:
+                print(f"      - Price lookup errors: {len(price_errors)} items")
+                for item in price_errors:
+                    print(f"        * {item}")
+
+            message = f"Processed {total_processed} items ({items_added} new, {items_updated} updated"
+            if prices_updated > 0:
+                message += f", {prices_updated} prices updated"
+            if amounts_updated > 0:
+                message += f", {amounts_updated} amounts updated"
+            message += ")"
+            if price_errors:
+                message += f", {len(price_errors)} price errors"
+
+            return True, message
         else:
             print(f"    Failed to add items to sales order: {result}")
             return False, result
@@ -711,7 +734,7 @@ def search_and_update_sales_orders(row_data, search_string, items_to_add):
             print(f"      (Total matches: {total_count}, showing first {len(orders)})")
 
         # Process each found sales order - add the items from spreadsheet
-        print(f"\n    Adding {len(items_to_add)} items to found sales orders...")
+        print(f"\n    Adding {len(items_to_add)} items to found sales orders (with pricing)...")
 
         successful_updates = 0
         failed_updates = 0
@@ -798,6 +821,7 @@ def monitor_sheet():
     print("FAILURE: Rows will be colored light red")
     print("Handles new rows added to sheet dynamically")
     print("Searches for 'Done?' header in any row, then looks for 'Yes' values below it")
+    print("Automatically retrieves and applies item pricing from SOS Inventory")
     print("Press Ctrl+C to stop monitoring")
 
     prev_hash = None
@@ -864,6 +888,7 @@ def main():
     print("Uses OAuth2 Bearer token authentication with GET → modify → PUT approach")
     print("Handles new rows added dynamically and targets the first worksheet")
     print("Searches for 'Done?' header anywhere in sheet, processes 'Yes' values below it")
+    print("Automatically retrieves and applies item pricing from SOS Inventory")
 
     print_separator("CONFIGURATION")
     print(f"Google Credentials: {GOOGLE_CREDENTIALS_FILE}")
@@ -886,6 +911,7 @@ def main():
     print("New Row Handling: Automatically detects and processes new rows added to sheet")
     print("Duplicate Prevention: Uses row signatures to avoid reprocessing")
     print("Header Detection: Searches entire sheet for 'Done?' header, processes rows below it")
+    print("Pricing: Automatically retrieves item selling prices from SOS Inventory API")
     print("Color coding:")
     print("  - Light blue: Successful sales order search and item addition")
     print("  - Light red: Errors (SOS API failure, invalid data, no orders found, etc.)")
