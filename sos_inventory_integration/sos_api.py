@@ -1,5 +1,6 @@
 import requests
 import json
+from datetime import datetime
 
 API_BASE_URL = "https://api.sosinventory.com/api/v2"
 
@@ -76,6 +77,16 @@ def make_request(method, endpoint, access_token, data=None, params=None):
 
     except Exception as e:
         return False, f"Request error: {str(e)}"
+
+
+def get_current_date_string():
+    """
+    Get current date in YYYY-MM-DD format for SOS Inventory
+
+    Returns:
+    - str: Current date in ISO format
+    """
+    return datetime.now().strftime("%Y-%m-%d")
 
 
 def get_sales_order_by_id(sales_order_id, access_token):
@@ -209,6 +220,9 @@ def add_or_update_item_in_sales_order(sales_order_id, item_id, quantity_to_add, 
         else:
             unit_price = item_details.get("price", 0.0)
 
+        # Get current date for line item due date
+        current_date = get_current_date_string()
+
         # Find existing item or add new one
         existing_line_index = None
         for index, line in enumerate(lines):
@@ -218,12 +232,14 @@ def add_or_update_item_in_sales_order(sales_order_id, item_id, quantity_to_add, 
                 break
 
         if existing_line_index is not None:
-            # Update existing line quantity and check/update price and amount
+            # Update existing line quantity and check/update price, amount, and due date
             current_quantity = lines[existing_line_index].get("quantity", 0)
             current_price = lines[existing_line_index].get("unitprice", 0.0)
+            current_due_date = lines[existing_line_index].get("duedate", "")
             new_quantity = current_quantity + quantity_to_add
 
             lines[existing_line_index]["quantity"] = new_quantity
+            lines[existing_line_index]["duedate"] = current_date
 
             # Compare prices and update if different
             try:
@@ -233,22 +249,22 @@ def add_or_update_item_in_sales_order(sales_order_id, item_id, quantity_to_add, 
                     new_amount = calculate_line_amount(new_quantity, unit_price)
                     lines[existing_line_index]["amount"] = new_amount
                     print(
-                        f"Updated existing line: quantity {current_quantity} -> {new_quantity}, price ${current_price_float} -> ${unit_price}, amount -> ${new_amount}")
+                        f"Updated existing line: quantity {current_quantity} -> {new_quantity}, price ${current_price_float} -> ${unit_price}, amount -> ${new_amount}, due date -> {current_date}")
                 else:
                     # Price unchanged, but quantity changed, so recalculate amount
                     new_amount = calculate_line_amount(new_quantity, unit_price)
                     lines[existing_line_index]["amount"] = new_amount
                     print(
-                        f"Updated existing line quantity: {current_quantity} -> {new_quantity}, amount -> ${new_amount} (price unchanged: ${current_price_float})")
+                        f"Updated existing line: quantity {current_quantity} -> {new_quantity}, amount -> ${new_amount}, due date {current_due_date} -> {current_date} (price unchanged: ${current_price_float})")
             except (ValueError, TypeError):
                 # If current price is invalid, update it
                 lines[existing_line_index]["unitprice"] = unit_price
                 new_amount = calculate_line_amount(new_quantity, unit_price)
                 lines[existing_line_index]["amount"] = new_amount
                 print(
-                    f"Updated existing line: quantity {current_quantity} -> {new_quantity}, fixed invalid price '{current_price}' -> ${unit_price}, amount -> ${new_amount}")
+                    f"Updated existing line: quantity {current_quantity} -> {new_quantity}, fixed invalid price '{current_price}' -> ${unit_price}, amount -> ${new_amount}, due date -> {current_date}")
         else:
-            # Add new line with retrieved price and calculated amount
+            # Add new line with retrieved price, calculated amount, and current due date
             next_line_number = max([line.get("lineNumber", 0) for line in lines], default=0) + 1
             line_amount = calculate_line_amount(quantity_to_add, unit_price)
             new_line = {
@@ -257,10 +273,11 @@ def add_or_update_item_in_sales_order(sales_order_id, item_id, quantity_to_add, 
                 "quantity": quantity_to_add,
                 "unitprice": unit_price,
                 "amount": line_amount,
+                "duedate": current_date,
                 "tax": {"taxable": False, "taxCode": None}
             }
             lines.append(new_line)
-            print(f"Added new line with price and amount: {new_line}")
+            print(f"Added new line with price, amount, and due date: {new_line}")
 
         # Update the lines in current data
         current_data["lines"] = lines
@@ -296,6 +313,10 @@ def add_multiple_items_to_sales_order(sales_order_id, items_to_add, access_token
         # Extract the data portion
         current_data = response.get("data", response)
 
+        # Get current date for line item due dates
+        current_date = get_current_date_string()
+        print(f"[API DEBUG] Setting line item due dates to: {current_date}")
+
         # Get current lines
         lines = current_data.get("lines", [])
 
@@ -303,6 +324,7 @@ def add_multiple_items_to_sales_order(sales_order_id, items_to_add, access_token
         items_updated = 0
         prices_updated = 0
         amounts_updated = 0
+        due_dates_updated = 0
         price_errors = []
 
         for item_data in items_to_add:
@@ -334,13 +356,19 @@ def add_multiple_items_to_sales_order(sales_order_id, items_to_add, access_token
                     break
 
             if existing_line_index is not None:
-                # Update existing line quantity and check/update price and amount
+                # Update existing line quantity and check/update price, amount, and due date
                 current_quantity = lines[existing_line_index].get("quantity", 0)
                 current_price = lines[existing_line_index].get("unitprice", 0.0)
                 current_amount = lines[existing_line_index].get("amount", 0.0)
+                current_due_date = lines[existing_line_index].get("duedate", "")
                 new_quantity = current_quantity + quantity
 
                 lines[existing_line_index]["quantity"] = new_quantity
+
+                # Update due date
+                lines[existing_line_index]["duedate"] = current_date
+                if current_due_date != current_date:
+                    due_dates_updated += 1
 
                 # Compare prices and update if different
                 price_updated = False
@@ -365,14 +393,14 @@ def add_multiple_items_to_sales_order(sales_order_id, items_to_add, access_token
 
                 if price_updated:
                     print(
-                        f"Updated existing item {item_name} (ID: {item_id}): quantity {current_quantity} -> {new_quantity}, price ${current_price_float} -> ${unit_price}, amount ${old_amount} -> ${new_amount}")
+                        f"Updated existing item {item_name} (ID: {item_id}): quantity {current_quantity} -> {new_quantity}, price ${current_price_float} -> ${unit_price}, amount ${old_amount} -> ${new_amount}, due date {current_due_date} -> {current_date}")
                 else:
                     print(
-                        f"Updated existing item {item_name} (ID: {item_id}): quantity {current_quantity} -> {new_quantity}, amount ${old_amount} -> ${new_amount} (price unchanged: ${unit_price})")
+                        f"Updated existing item {item_name} (ID: {item_id}): quantity {current_quantity} -> {new_quantity}, amount ${old_amount} -> ${new_amount}, due date {current_due_date} -> {current_date} (price unchanged: ${unit_price})")
 
                 items_updated += 1
             else:
-                # Add new line with retrieved price and calculated amount
+                # Add new line with retrieved price, calculated amount, and current due date
                 next_line_number = max([line.get("lineNumber", 0) for line in lines], default=0) + 1
                 line_amount = calculate_line_amount(quantity, unit_price)
                 new_line = {
@@ -381,13 +409,15 @@ def add_multiple_items_to_sales_order(sales_order_id, items_to_add, access_token
                     "quantity": quantity,
                     "unitprice": unit_price,
                     "amount": line_amount,
+                    "duedate": current_date,
                     "tax": {"taxable": False, "taxCode": None}
                 }
                 lines.append(new_line)
                 print(
-                    f"Added new item {item_name} (ID: {item_id}) with quantity: {quantity}, price: ${unit_price}, amount: ${line_amount}")
+                    f"Added new item {item_name} (ID: {item_id}) with quantity: {quantity}, price: ${unit_price}, amount: ${line_amount}, due date: {current_date}")
                 items_added += 1
                 amounts_updated += 1
+                due_dates_updated += 1
 
         # Update the lines in current data
         current_data["lines"] = lines
@@ -401,9 +431,17 @@ def add_multiple_items_to_sales_order(sales_order_id, items_to_add, access_token
                 success_message += f" (updated {prices_updated} prices"
                 if amounts_updated > 0:
                     success_message += f", {amounts_updated} amounts"
+                if due_dates_updated > 0:
+                    success_message += f", {due_dates_updated} due dates"
                 success_message += ")"
-            elif amounts_updated > 0:
-                success_message += f" (updated {amounts_updated} amounts)"
+            elif amounts_updated > 0 or due_dates_updated > 0:
+                updates = []
+                if amounts_updated > 0:
+                    updates.append(f"{amounts_updated} amounts")
+                if due_dates_updated > 0:
+                    updates.append(f"{due_dates_updated} due dates")
+                success_message += f" (updated {', '.join(updates)})"
+
             if price_errors:
                 success_message += f". Price lookup failed for: {', '.join(price_errors)}"
             print(success_message)
@@ -414,6 +452,8 @@ def add_multiple_items_to_sales_order(sales_order_id, items_to_add, access_token
                 "items_updated": items_updated,
                 "prices_updated": prices_updated,
                 "amounts_updated": amounts_updated,
+                "due_dates_updated": due_dates_updated,
+                "due_date_set": current_date,
                 "total_processed": items_added + items_updated,
                 "price_errors": price_errors
             }

@@ -558,11 +558,13 @@ def add_items_to_sales_order(sales_order_id, items_to_add):
         )
 
         if success:
-            # Extract update statistics including price and amount updates
+            # Extract update statistics including price, amount, and due date updates
             items_added = result.get("items_added", 0)
             items_updated = result.get("items_updated", 0)
             prices_updated = result.get("prices_updated", 0)
             amounts_updated = result.get("amounts_updated", 0)
+            due_dates_updated = result.get("due_dates_updated", 0)
+            due_date_set = result.get("due_date_set", "")
             total_processed = result.get("total_processed", 0)
             price_errors = result.get("price_errors", [])
 
@@ -576,6 +578,9 @@ def add_items_to_sales_order(sales_order_id, items_to_add):
             if amounts_updated > 0:
                 print(f"      - Line amounts updated: {amounts_updated}")
 
+            if due_dates_updated > 0:
+                print(f"      - Due dates updated: {due_dates_updated} (set to {due_date_set})")
+
             if price_errors:
                 print(f"      - Price lookup errors: {len(price_errors)} items")
                 for item in price_errors:
@@ -586,6 +591,8 @@ def add_items_to_sales_order(sales_order_id, items_to_add):
                 message += f", {prices_updated} prices updated"
             if amounts_updated > 0:
                 message += f", {amounts_updated} amounts updated"
+            if due_dates_updated > 0:
+                message += f", {due_dates_updated} due dates updated to {due_date_set}"
             message += ")"
             if price_errors:
                 message += f", {len(price_errors)} price errors"
@@ -598,7 +605,6 @@ def add_items_to_sales_order(sales_order_id, items_to_add):
     except Exception as e:
         print(f"    Exception while processing sales order: {str(e)}")
         return False, f"Exception while adding items: {str(e)}"
-
 
 def process_completed_row(row_data):
     """Process a newly completed row by searching SOS Inventory sales orders and adding items from spreadsheet"""
