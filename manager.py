@@ -648,7 +648,7 @@ def process_completed_row(row_data):
                 current_month = get_current_month_name()
                 print(f"\nColumn B value: '{column_b_value}'")
                 print(f"Current month: '{current_month}'")
-                print(f"Full search string: '{search_string}'")
+                print(f"Search patterns: '{column_b_value} {current_month}' and '{column_b_value}  {current_month}'")
 
                 # Extract items from the sheet data
                 if not _sheet_data_cache:
@@ -658,8 +658,9 @@ def process_completed_row(row_data):
                     items_to_add = extract_items_from_sheet_data(_sheet_data_cache, row_data)
 
                     if not items_to_add:
-                        error_reason = "No items found to add from this row"
-                        success = False
+                        print("No items found to add from this row (after skipping items with ID '0')")
+                        success = True  # Treat as success - color blue
+                        error_reason = None
                     else:
                         # Search SOS Inventory for sales orders and add items
                         success, error_reason = search_and_update_sales_orders(row_data, search_string, items_to_add)
