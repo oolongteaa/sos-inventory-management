@@ -170,7 +170,7 @@ def extract_items_from_sheet_data(sheet_data, row_data):
     - row_data: The specific row being processed
 
     Returns:
-    - List of dictionaries with item_id, quantity, and name
+    - List of dictionaries with item_id, quantity, name, force_new_line flag, and row_date
     """
     try:
         if not sheet_data or len(sheet_data) < 3:
@@ -186,10 +186,50 @@ def extract_items_from_sheet_data(sheet_data, row_data):
         # Get quantities from the current row data
         quantities = row_data.get('data', [])
 
+        # Get the date from column A (index 0) of the current row
+        row_date = None
+        if len(quantities) > 0 and quantities[0]:
+            row_date_str = str(quantities[0]).strip()
+            # Try to parse and format the date
+            try:
+                # Handle various date formats that might come from Google Sheets
+                from datetime import datetime
+                import re
+
+                # Remove any time portion if present
+                date_part = row_date_str.split(' ')[0] if ' ' in row_date_str else row_date_str
+
+                # Try different date formats
+                date_formats = [
+                    "%Y-%m-%d",  # 2024-01-15
+                    "%m/%d/%Y",  # 1/15/2024 or 01/15/2024
+                    "%d/%m/%Y",  # 15/1/2024 or 15/01/2024
+                    "%m-%d-%Y",  # 1-15-2024 or 01-15-2024
+                    "%d-%m-%Y",  # 15-1-2024 or 15-01-2024
+                ]
+
+                parsed_date = None
+                for fmt in date_formats:
+                    try:
+                        parsed_date = datetime.strptime(date_part, fmt)
+                        break
+                    except ValueError:
+                        continue
+
+                if parsed_date:
+                    row_date = parsed_date.strftime("%Y-%m-%d")
+                    print(f"    [DEBUG] Parsed row date: {row_date_str} -> {row_date}")
+                else:
+                    print(f"    [DEBUG] Could not parse date '{row_date_str}', will use current date")
+
+            except Exception as e:
+                print(f"    [DEBUG] Error parsing date '{row_date_str}': {e}, will use current date")
+
         print(f"    [DEBUG] Processing items from sheet:")
         print(f"      Item IDs row: {len(item_ids)} columns")
         print(f"      Item names row: {len(item_names)} columns")
         print(f"      Current row data: {len(quantities)} columns")
+        print(f"      Row date: {row_date if row_date else 'current date'}")
 
         items_to_add = []
 
@@ -224,21 +264,39 @@ def extract_items_from_sheet_data(sheet_data, row_data):
             # Clean up the data
             item_id_clean = str(item_id).strip()
 
-            # Skip items with ID "000"
             if item_id_clean == "0":
                 print(f"      Skipping item with ID '0' in column {col_index}")
                 continue
 
             item_name_clean = str(item_name).strip() if item_name else f"Item {item_id_clean}"
 
+            # Check if this item has a sales price (force new line if it does)
+            force_new_line = False
+
+            # Get item details to check for sales price
+            if _sos_access_token:  # Make sure we have a token
+                price_success, item_details = sos_api.get_item_price_and_details(item_id_clean, _sos_access_token)
+                if price_success:
+                    sales_price = item_details.get("price", 0.0)
+                    if sales_price > 0:
+                        force_new_line = True
+                        print(
+                            f"      Item {item_name_clean} (ID: {item_id_clean}) has sales price ${sales_price} - will force new line")
+                else:
+                    print(f"      Warning: Could not check sales price for item {item_id_clean}: {item_details}")
+
             items_to_add.append({
                 "item_id": item_id_clean,
                 "quantity": quantity,
                 "name": item_name_clean,
-                "column": col_index
+                "column": col_index,
+                "force_new_line": force_new_line,
+                "row_date": row_date  # Include the parsed date
             })
 
-            print(f"      Found: {item_name_clean} (ID: {item_id_clean}) - Qty: {quantity}")
+            print(f"      Found: {item_name_clean} (ID: {item_id_clean}) - Qty: {quantity}" +
+                  (" [NEW LINE]" if force_new_line else "") +
+                  (f" [Date: {row_date}]" if row_date else " [Date: current]"))
 
         print(f"    [DEBUG] Total items to add: {len(items_to_add)}")
         return items_to_add
@@ -542,75 +600,62 @@ def validate_row_data(row_data):
 
 def add_items_to_sales_order(sales_order_id, items_to_add):
     """
-    Add multiple items to sales order using the API function with pricing
+    Add items to a sales order in SOS Inventory
 
     Parameters:
-    - sales_order_id: ID of the sales order
-    - items_to_add: List of item dictionaries from extract_items_from_sheet_data
+    - sales_order_id: The ID of the sales order
+    - items_to_add: List of items with item_id, quantity, name, force_new_line flag, and row_date
 
     Returns:
-    - Tuple (success: bool, message: str)
+    - Tuple: (success, message)
     """
     try:
-        print(f"    [DEBUG] Adding {len(items_to_add)} items to sales order {sales_order_id}")
+        # Add each item to the sales order
+        successful_additions = []
+        failed_additions = []
 
-        # Ensure we have a valid token before proceeding
-        if not ensure_valid_sos_token():
-            return False, "Failed to obtain valid SOS authentication token"
+        for item in items_to_add:
+            item_id = item["item_id"]
+            quantity = item["quantity"]
+            item_name = item["name"]
+            force_new_line = item.get("force_new_line", False)
+            row_date = item.get("row_date")  # Get the date from the item
 
-        # Use the API function that handles multiple items with pricing
-        success, result = sos_api.add_multiple_items_to_sales_order(
-            sales_order_id, items_to_add, _sos_access_token
-        )
+            print(f"        Adding item: {item_name} (ID: {item_id}) x {quantity}" +
+                  (" [FORCE NEW LINE]" if force_new_line else "") +
+                  (f" [Date: {row_date}]" if row_date else " [Date: current]"))
 
-        if success:
-            # Extract update statistics including price, amount, and due date updates
-            items_added = result.get("items_added", 0)
-            items_updated = result.get("items_updated", 0)
-            prices_updated = result.get("prices_updated", 0)
-            amounts_updated = result.get("amounts_updated", 0)
-            due_dates_updated = result.get("due_dates_updated", 0)
-            due_date_set = result.get("due_date_set", "")
-            total_processed = result.get("total_processed", 0)
-            price_errors = result.get("price_errors", [])
+            # Add item to sales order with the row date
+            success, result = sos_api.add_item_to_sales_order(
+                sales_order_id,
+                item_id,
+                quantity,
+                _sos_access_token,
+                force_new_line=force_new_line,
+                line_date=row_date  # Pass the date from the row
+            )
 
-            print(f"    Successfully processed {total_processed} items:")
-            print(f"      - New items added: {items_added}")
-            print(f"      - Existing items updated: {items_updated}")
+            if success:
+                successful_additions.append(f"{item_name} x{quantity}")
+                print(f"          SUCCESS: Added {item_name} x{quantity}")
+            else:
+                failed_additions.append(f"{item_name} x{quantity}: {result}")
+                print(f"          ERROR: Failed to add {item_name} x{quantity} - {result}")
 
-            if prices_updated > 0:
-                print(f"      - Prices updated: {prices_updated}")
-
-            if amounts_updated > 0:
-                print(f"      - Line amounts updated: {amounts_updated}")
-
-            if due_dates_updated > 0:
-                print(f"      - Due dates updated: {due_dates_updated} (set to {due_date_set})")
-
-            if price_errors:
-                print(f"      - Price lookup errors: {len(price_errors)} items")
-                for item in price_errors:
-                    print(f"        * {item}")
-
-            message = f"Processed {total_processed} items ({items_added} new, {items_updated} updated"
-            if prices_updated > 0:
-                message += f", {prices_updated} prices updated"
-            if amounts_updated > 0:
-                message += f", {amounts_updated} amounts updated"
-            if due_dates_updated > 0:
-                message += f", {due_dates_updated} due dates updated to {due_date_set}"
-            message += ")"
-            if price_errors:
-                message += f", {len(price_errors)} price errors"
-
-            return True, message
+        # Summary
+        if successful_additions:
+            success_msg = f"Added {len(successful_additions)} items: {', '.join(successful_additions)}"
+            if failed_additions:
+                fail_msg = f"Failed to add {len(failed_additions)} items: {', '.join(failed_additions)}"
+                return True, f"{success_msg}. {fail_msg}"
+            else:
+                return True, success_msg
         else:
-            print(f"    Failed to add items to sales order: {result}")
-            return False, result
+            fail_msg = f"Failed to add all {len(failed_additions)} items: {', '.join(failed_additions)}"
+            return False, fail_msg
 
     except Exception as e:
-        print(f"    Exception while processing sales order: {str(e)}")
-        return False, f"Exception while adding items: {str(e)}"
+        return False, f"Exception adding items to sales order: {str(e)}"
 
 def process_completed_row(row_data):
     """Process a newly completed row by searching SOS Inventory sales orders and adding items from spreadsheet"""

@@ -199,7 +199,21 @@ def calculate_line_amount(quantity, unit_price):
         return 0.0
 
 
-def add_or_update_item_in_sales_order(sales_order_id, item_id, quantity_to_add, access_token):
+def add_item_to_sales_order(sales_order_id, item_id, quantity, access_token, force_new_line=False, line_date=None):
+    """
+    Add an item to a sales order
+
+    Parameters:
+    - sales_order_id: ID of the sales order
+    - item_id: ID of the item to add
+    - quantity: Quantity to add
+    - access_token: SOS Inventory access token
+    - force_new_line: If True, always create a new line item instead of updating existing quantity
+    - line_date: Date to use for the line item (YYYY-MM-DD format), uses current date if None
+
+    Returns:
+    - Tuple: (success, result/error_message)
+    """
     try:
         # Get current sales order
         success, response = get_sales_order_by_id(sales_order_id, access_token)
@@ -217,76 +231,109 @@ def add_or_update_item_in_sales_order(sales_order_id, item_id, quantity_to_add, 
         if not price_success:
             print(f"Warning: Could not get details for item {item_id}, using defaults: {item_details}")
             unit_price = 0.0
+            item_name = f"Item {item_id}"
         else:
             unit_price = item_details.get("price", 0.0)
+            item_name = item_details.get("name", f"Item {item_id}")
 
-        # Get current date for line item due date
-        current_date = get_current_date_string()
+        # Use provided date or current date for line item due date
+        due_date = line_date if line_date else get_current_date_string()
 
-        # Find existing item or add new one
-        existing_line_index = None
-        for index, line in enumerate(lines):
-            item_info = line.get("item", {})
-            if isinstance(item_info, dict) and str(item_info.get("id")) == str(item_id):
-                existing_line_index = index
-                break
+        if force_new_line:
+            # Always create a new line item, don't look for existing ones
+            next_line_number = max([line.get("lineNumber", 0) for line in lines], default=0) + 1
+            line_amount = calculate_line_amount(quantity, unit_price)
+            new_line = {
+                "lineNumber": next_line_number,
+                "item": {"id": item_id},
+                "quantity": quantity,
+                "unitprice": unit_price,
+                "amount": line_amount,
+                "duedate": due_date,
+                "tax": {"taxable": False, "taxCode": None}
+            }
+            lines.append(new_line)
+            print(
+                f"[FORCE NEW LINE] Added new line for {item_name} (ID: {item_id}) with quantity: {quantity}, price: ${unit_price}, amount: ${line_amount}, date: {due_date}")
+        else:
+            # Find existing item or add new one (original behavior)
+            existing_line_index = None
+            for index, line in enumerate(lines):
+                item_info = line.get("item", {})
+                if isinstance(item_info, dict) and str(item_info.get("id")) == str(item_id):
+                    existing_line_index = index
+                    break
 
-        if existing_line_index is not None:
-            # Update existing line quantity and check/update price, amount, and due date
-            current_quantity = lines[existing_line_index].get("quantity", 0)
-            current_price = lines[existing_line_index].get("unitprice", 0.0)
-            current_due_date = lines[existing_line_index].get("duedate", "")
-            new_quantity = current_quantity + quantity_to_add
+            if existing_line_index is not None:
+                # Update existing line quantity and check/update price, amount, and due date
+                current_quantity = lines[existing_line_index].get("quantity", 0)
+                current_price = lines[existing_line_index].get("unitprice", 0.0)
+                current_due_date = lines[existing_line_index].get("duedate", "")
+                new_quantity = current_quantity + quantity
 
-            lines[existing_line_index]["quantity"] = new_quantity
-            lines[existing_line_index]["duedate"] = current_date
+                lines[existing_line_index]["quantity"] = new_quantity
+                lines[existing_line_index]["duedate"] = due_date
 
-            # Compare prices and update if different
-            try:
-                current_price_float = float(current_price)
-                if abs(current_price_float - unit_price) > 0.001:  # Use small tolerance for float comparison
+                # Compare prices and update if different
+                try:
+                    current_price_float = float(current_price)
+                    if abs(current_price_float - unit_price) > 0.001:  # Use small tolerance for float comparison
+                        lines[existing_line_index]["unitprice"] = unit_price
+                        new_amount = calculate_line_amount(new_quantity, unit_price)
+                        lines[existing_line_index]["amount"] = new_amount
+                        print(
+                            f"Updated existing line: quantity {current_quantity} -> {new_quantity}, price ${current_price_float} -> ${unit_price}, amount -> ${new_amount}, due date -> {due_date}")
+                    else:
+                        # Price unchanged, but quantity changed, so recalculate amount
+                        new_amount = calculate_line_amount(new_quantity, unit_price)
+                        lines[existing_line_index]["amount"] = new_amount
+                        print(
+                            f"Updated existing line: quantity {current_quantity} -> {new_quantity}, amount -> ${new_amount}, due date {current_due_date} -> {due_date} (price unchanged: ${current_price_float})")
+                except (ValueError, TypeError):
+                    # If current price is invalid, update it
                     lines[existing_line_index]["unitprice"] = unit_price
                     new_amount = calculate_line_amount(new_quantity, unit_price)
                     lines[existing_line_index]["amount"] = new_amount
                     print(
-                        f"Updated existing line: quantity {current_quantity} -> {new_quantity}, price ${current_price_float} -> ${unit_price}, amount -> ${new_amount}, due date -> {current_date}")
-                else:
-                    # Price unchanged, but quantity changed, so recalculate amount
-                    new_amount = calculate_line_amount(new_quantity, unit_price)
-                    lines[existing_line_index]["amount"] = new_amount
-                    print(
-                        f"Updated existing line: quantity {current_quantity} -> {new_quantity}, amount -> ${new_amount}, due date {current_due_date} -> {current_date} (price unchanged: ${current_price_float})")
-            except (ValueError, TypeError):
-                # If current price is invalid, update it
-                lines[existing_line_index]["unitprice"] = unit_price
-                new_amount = calculate_line_amount(new_quantity, unit_price)
-                lines[existing_line_index]["amount"] = new_amount
+                        f"Updated existing line: quantity {current_quantity} -> {new_quantity}, fixed invalid price '{current_price}' -> ${unit_price}, amount -> ${new_amount}, due date -> {due_date}")
+            else:
+                # Add new line with retrieved price, calculated amount, and provided due date
+                next_line_number = max([line.get("lineNumber", 0) for line in lines], default=0) + 1
+                line_amount = calculate_line_amount(quantity, unit_price)
+                new_line = {
+                    "lineNumber": next_line_number,
+                    "item": {"id": item_id},
+                    "quantity": quantity,
+                    "unitprice": unit_price,
+                    "amount": line_amount,
+                    "duedate": due_date,
+                    "tax": {"taxable": False, "taxCode": None}
+                }
+                lines.append(new_line)
                 print(
-                    f"Updated existing line: quantity {current_quantity} -> {new_quantity}, fixed invalid price '{current_price}' -> ${unit_price}, amount -> ${new_amount}, due date -> {current_date}")
-        else:
-            # Add new line with retrieved price, calculated amount, and current due date
-            next_line_number = max([line.get("lineNumber", 0) for line in lines], default=0) + 1
-            line_amount = calculate_line_amount(quantity_to_add, unit_price)
-            new_line = {
-                "lineNumber": next_line_number,
-                "item": {"id": item_id},
-                "quantity": quantity_to_add,
-                "unitprice": unit_price,
-                "amount": line_amount,
-                "duedate": current_date,
-                "tax": {"taxable": False, "taxCode": None}
-            }
-            lines.append(new_line)
-            print(f"Added new line with price, amount, and due date: {new_line}")
+                    f"Added new line: {item_name} (ID: {item_id}) with quantity: {quantity}, price: ${unit_price}, amount: ${line_amount}, date: {due_date}")
 
         # Update the lines in current data
         current_data["lines"] = lines
 
         # Send update
-        return update_sales_order(sales_order_id, current_data, access_token)
+        update_success, update_result = update_sales_order(sales_order_id, current_data, access_token)
+
+        if update_success:
+            return True, f"Successfully added {item_name} x{quantity}" + (
+                " [NEW LINE]" if force_new_line else "") + f" [Date: {due_date}]"
+        else:
+            return False, update_result
 
     except Exception as e:
         return False, f"Exception: {str(e)}"
+
+
+def add_or_update_item_in_sales_order(sales_order_id, item_id, quantity_to_add, access_token):
+    """
+    Legacy function - maintained for backwards compatibility
+    """
+    return add_item_to_sales_order(sales_order_id, item_id, quantity_to_add, access_token, force_new_line=False)
 
 
 def add_multiple_items_to_sales_order(sales_order_id, items_to_add, access_token):
@@ -295,8 +342,8 @@ def add_multiple_items_to_sales_order(sales_order_id, items_to_add, access_token
 
     Parameters:
     - sales_order_id: ID of the sales order
-    - items_to_add: List of dictionaries with item_id, quantity, and optional name
-      Format: [{"item_id": "123", "quantity": 2, "name": "Item Name"}, ...]
+    - items_to_add: List of dictionaries with item_id, quantity, name, optional force_new_line, and optional row_date
+      Format: [{"item_id": "123", "quantity": 2, "name": "Item Name", "force_new_line": False, "row_date": "2024-01-15"}, ...]
     - access_token: SOS API access token
 
     Returns:
@@ -313,15 +360,12 @@ def add_multiple_items_to_sales_order(sales_order_id, items_to_add, access_token
         # Extract the data portion
         current_data = response.get("data", response)
 
-        # Get current date for line item due dates
-        current_date = get_current_date_string()
-        print(f"[API DEBUG] Setting line item due dates to: {current_date}")
-
         # Get current lines
         lines = current_data.get("lines", [])
 
         items_added = 0
         items_updated = 0
+        new_lines_forced = 0
         prices_updated = 0
         amounts_updated = 0
         due_dates_updated = 0
@@ -331,6 +375,11 @@ def add_multiple_items_to_sales_order(sales_order_id, items_to_add, access_token
             item_id = str(item_data.get("item_id", ""))
             quantity = item_data.get("quantity", 0)
             item_name = item_data.get("name", f"Item {item_id}")
+            force_new_line = item_data.get("force_new_line", False)
+            row_date = item_data.get("row_date")  # Get the date from the item data
+
+            # Use row date or fall back to current date
+            due_date = row_date if row_date else get_current_date_string()
 
             if not item_id or quantity <= 0:
                 print(f"Skipping invalid item: {item_data}")
@@ -347,60 +396,8 @@ def add_multiple_items_to_sales_order(sales_order_id, items_to_add, access_token
                 item_full_name = item_details.get("fullname", item_name)
                 print(f"[API DEBUG] Retrieved price ${unit_price} for item {item_full_name} (ID: {item_id})")
 
-            # Find existing item or add new one
-            existing_line_index = None
-            for index, line in enumerate(lines):
-                item_info = line.get("item", {})
-                if isinstance(item_info, dict) and str(item_info.get("id")) == item_id:
-                    existing_line_index = index
-                    break
-
-            if existing_line_index is not None:
-                # Update existing line quantity and check/update price, amount, and due date
-                current_quantity = lines[existing_line_index].get("quantity", 0)
-                current_price = lines[existing_line_index].get("unitprice", 0.0)
-                current_amount = lines[existing_line_index].get("amount", 0.0)
-                current_due_date = lines[existing_line_index].get("duedate", "")
-                new_quantity = current_quantity + quantity
-
-                lines[existing_line_index]["quantity"] = new_quantity
-
-                # Update due date
-                lines[existing_line_index]["duedate"] = current_date
-                if current_due_date != current_date:
-                    due_dates_updated += 1
-
-                # Compare prices and update if different
-                price_updated = False
-                try:
-                    current_price_float = float(current_price)
-                    if abs(current_price_float - unit_price) > 0.001:  # Use small tolerance for float comparison
-                        lines[existing_line_index]["unitprice"] = unit_price
-                        price_updated = True
-                        prices_updated += 1
-                except (ValueError, TypeError):
-                    # If current price is invalid, update it
-                    lines[existing_line_index]["unitprice"] = unit_price
-                    price_updated = True
-                    prices_updated += 1
-                    current_price_float = 0.0  # For logging
-
-                # Calculate new amount (always update since quantity changed)
-                new_amount = calculate_line_amount(new_quantity, unit_price)
-                old_amount = current_amount
-                lines[existing_line_index]["amount"] = new_amount
-                amounts_updated += 1
-
-                if price_updated:
-                    print(
-                        f"Updated existing item {item_name} (ID: {item_id}): quantity {current_quantity} -> {new_quantity}, price ${current_price_float} -> ${unit_price}, amount ${old_amount} -> ${new_amount}, due date {current_due_date} -> {current_date}")
-                else:
-                    print(
-                        f"Updated existing item {item_name} (ID: {item_id}): quantity {current_quantity} -> {new_quantity}, amount ${old_amount} -> ${new_amount}, due date {current_due_date} -> {current_date} (price unchanged: ${unit_price})")
-
-                items_updated += 1
-            else:
-                # Add new line with retrieved price, calculated amount, and current due date
+            if force_new_line:
+                # Always create a new line item, don't look for existing ones
                 next_line_number = max([line.get("lineNumber", 0) for line in lines], default=0) + 1
                 line_amount = calculate_line_amount(quantity, unit_price)
                 new_line = {
@@ -409,15 +406,88 @@ def add_multiple_items_to_sales_order(sales_order_id, items_to_add, access_token
                     "quantity": quantity,
                     "unitprice": unit_price,
                     "amount": line_amount,
-                    "duedate": current_date,
+                    "duedate": due_date,
                     "tax": {"taxable": False, "taxCode": None}
                 }
                 lines.append(new_line)
                 print(
-                    f"Added new item {item_name} (ID: {item_id}) with quantity: {quantity}, price: ${unit_price}, amount: ${line_amount}, due date: {current_date}")
+                    f"[FORCE NEW LINE] Added new line for {item_name} (ID: {item_id}) with quantity: {quantity}, price: ${unit_price}, amount: ${line_amount}, due date: {due_date}")
                 items_added += 1
+                new_lines_forced += 1
                 amounts_updated += 1
                 due_dates_updated += 1
+            else:
+                # Find existing item or add new one (original behavior)
+                existing_line_index = None
+                for index, line in enumerate(lines):
+                    item_info = line.get("item", {})
+                    if isinstance(item_info, dict) and str(item_info.get("id")) == item_id:
+                        existing_line_index = index
+                        break
+
+                if existing_line_index is not None:
+                    # Update existing line quantity and check/update price, amount, and due date
+                    current_quantity = lines[existing_line_index].get("quantity", 0)
+                    current_price = lines[existing_line_index].get("unitprice", 0.0)
+                    current_amount = lines[existing_line_index].get("amount", 0.0)
+                    current_due_date = lines[existing_line_index].get("duedate", "")
+                    new_quantity = current_quantity + quantity
+
+                    lines[existing_line_index]["quantity"] = new_quantity
+
+                    # Update due date
+                    lines[existing_line_index]["duedate"] = due_date
+                    if current_due_date != due_date:
+                        due_dates_updated += 1
+
+                    # Compare prices and update if different
+                    price_updated = False
+                    try:
+                        current_price_float = float(current_price)
+                        if abs(current_price_float - unit_price) > 0.001:  # Use small tolerance for float comparison
+                            lines[existing_line_index]["unitprice"] = unit_price
+                            price_updated = True
+                            prices_updated += 1
+                    except (ValueError, TypeError):
+                        # If current price is invalid, update it
+                        lines[existing_line_index]["unitprice"] = unit_price
+                        price_updated = True
+                        prices_updated += 1
+                        current_price_float = 0.0  # For logging
+
+                    # Calculate new amount (always update since quantity changed)
+                    new_amount = calculate_line_amount(new_quantity, unit_price)
+                    old_amount = current_amount
+                    lines[existing_line_index]["amount"] = new_amount
+                    amounts_updated += 1
+
+                    if price_updated:
+                        print(
+                            f"Updated existing item {item_name} (ID: {item_id}): quantity {current_quantity} -> {new_quantity}, price ${current_price_float} -> ${unit_price}, amount ${old_amount} -> ${new_amount}, due date {current_due_date} -> {due_date}")
+                    else:
+                        print(
+                            f"Updated existing item {item_name} (ID: {item_id}): quantity {current_quantity} -> {new_quantity}, amount ${old_amount} -> ${new_amount}, due date {current_due_date} -> {due_date} (price unchanged: ${unit_price})")
+
+                    items_updated += 1
+                else:
+                    # Add new line with retrieved price, calculated amount, and provided due date
+                    next_line_number = max([line.get("lineNumber", 0) for line in lines], default=0) + 1
+                    line_amount = calculate_line_amount(quantity, unit_price)
+                    new_line = {
+                        "lineNumber": next_line_number,
+                        "item": {"id": item_id},
+                        "quantity": quantity,
+                        "unitprice": unit_price,
+                        "amount": line_amount,
+                        "duedate": due_date,
+                        "tax": {"taxable": False, "taxCode": None}
+                    }
+                    lines.append(new_line)
+                    print(
+                        f"Added new item {item_name} (ID: {item_id}) with quantity: {quantity}, price: ${unit_price}, amount: ${line_amount}, due date: {due_date}")
+                    items_added += 1
+                    amounts_updated += 1
+                    due_dates_updated += 1
 
         # Update the lines in current data
         current_data["lines"] = lines
@@ -427,6 +497,8 @@ def add_multiple_items_to_sales_order(sales_order_id, items_to_add, access_token
 
         if success:
             success_message = f"Successfully added {items_added} new items and updated {items_updated} existing items"
+            if new_lines_forced > 0:
+                success_message += f" ({new_lines_forced} forced as new lines)"
             if prices_updated > 0:
                 success_message += f" (updated {prices_updated} prices"
                 if amounts_updated > 0:
@@ -450,10 +522,10 @@ def add_multiple_items_to_sales_order(sales_order_id, items_to_add, access_token
                 "updated_order": result,
                 "items_added": items_added,
                 "items_updated": items_updated,
+                "new_lines_forced": new_lines_forced,
                 "prices_updated": prices_updated,
                 "amounts_updated": amounts_updated,
                 "due_dates_updated": due_dates_updated,
-                "due_date_set": current_date,
                 "total_processed": items_added + items_updated,
                 "price_errors": price_errors
             }
