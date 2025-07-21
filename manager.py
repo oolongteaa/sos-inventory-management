@@ -76,7 +76,7 @@ def build_search_string(column_b_value):
         return None
 
     current_month = get_current_month_name()
-    search_string = f"{column_b_value.strip()} {current_month}"
+    search_string = column_b_value.strip()
 
     return search_string
 
@@ -696,98 +696,86 @@ def search_and_update_sales_orders(row_data, search_string, items_to_add):
         for item in items_to_add:
             print(f"    - {item['name']} (ID: {item['item_id']}) x {item['quantity']}")
 
-        # Search for sales orders containing the search string
-        print(f"  Searching sales orders containing: '{search_string}'...")
+        # Create search patterns for 1 and 2 spaces
+        current_month = get_current_month_name()
+        search_patterns = [
+            f"{search_string} {current_month}",  # 1 space
+            f"{search_string}  {current_month}"  # 2 spaces
+        ]
 
-        # Use the updated search function with a reasonable limit
-        success, result = sos_api.search_sales_orders_by_query(
-            search_string,
-            _sos_access_token,
-            additional_params={"maxresults": 50}
-        )
+        all_orders = []
+        orders_found_by_pattern = {}
 
-        if not success:
-            print(f"    ERROR: Failed to search sales orders: {result}")
-            return False, f"Search failed: {result}"
+        # Search with each pattern
+        for i, pattern in enumerate(search_patterns):
+            print(f"  Trying pattern {i + 1}: '{pattern}'...")
 
-        # Parse the response using the helper function
-        parsed_data = sos_api.parse_sales_order_response(result)
-        if not parsed_data:
-            print("    ERROR: Unable to parse sales order response")
-            return False, "Unable to parse response"
+            success, result = sos_api.search_sales_orders_by_query(
+                pattern,
+                _sos_access_token,
+                additional_params={"maxresults": 50}
+            )
 
-        orders = parsed_data["orders"]
-        total_count = parsed_data["total_count"]
+            if success:
+                parsed_data = sos_api.parse_sales_order_response(result)
+                if parsed_data:
+                    orders = parsed_data["orders"]
+                    orders_found_by_pattern[pattern] = len(orders)
+                    print(f"    Found {len(orders)} orders with pattern '{pattern}'")
 
-        print(f"    Found {len(orders)} sales orders containing '{search_string}' (total: {total_count})")
+                    # Add unique orders (avoid duplicates)
+                    for order in orders:
+                        if not any(existing_order.get("id") == order.get("id") for existing_order in all_orders):
+                            all_orders.append(order)
+                else:
+                    orders_found_by_pattern[pattern] = 0
+                    print(f"    No valid response for pattern '{pattern}'")
+            else:
+                orders_found_by_pattern[pattern] = 0
+                print(f"    Search failed for pattern '{pattern}': {result}")
 
-        if not orders:
-            print(f"    No sales orders found containing '{search_string}'")
-            print(
-                f"    Tried searching for: Column B ('{row_data.get('data', ['', ''])[1] if len(row_data.get('data', [])) > 1 else 'N/A'}') + Current Month ('{get_current_month_name()}')")
+        total_count = len(all_orders)
+        print(f"    Total unique orders found: {total_count}")
+
+        # Show breakdown by pattern
+        for pattern, count in orders_found_by_pattern.items():
+            if count > 0:
+                print(f"      '{pattern}': {count} orders")
+
+        if not all_orders:
+            print(f"    No sales orders found with either spacing pattern")
             return False, "No sales orders found"
 
         # Display the matching orders
         print("    Matching sales orders:")
-        for i, order in enumerate(orders[:10]):  # Show first 10 matches
+        for i, order in enumerate(all_orders[:10]):  # Show first 10 matches
             summary = sos_api.format_sales_order_summary(order)
             print(f"      {i + 1}. {summary}")
 
-        if len(orders) > 10:
-            print(f"      ... and {len(orders) - 10} more orders")
+        if len(all_orders) > 10:
+            print(f"      ... and {len(all_orders) - 10} more orders")
 
-        if total_count > len(orders):
-            print(f"      (Total matches: {total_count}, showing first {len(orders)})")
+        # Process only the first found sales order
+        first_order = all_orders[0]
+        order_id = first_order.get("id")
+        order_number = first_order.get("number", "Unknown")
 
-        # Process each found sales order - add the items from spreadsheet
-        print(f"\n    Adding {len(items_to_add)} items to found sales orders (with pricing)...")
+        if not order_id:
+            print(f"      First order ({order_number}): No ID found")
+            return False, "First order has no ID"
 
-        successful_updates = 0
-        failed_updates = 0
-        update_details = []
+        print(f"\n    Processing first order only: {order_number} (ID: {order_id})...")
+        print(f"    Adding {len(items_to_add)} items to this sales order (with pricing)...")
 
-        for i, order in enumerate(orders[:5]):  # Process first 5 orders to avoid overwhelming the system
-            order_id = order.get("id")
-            order_number = order.get("number", "Unknown")
+        # Add items to this sales order
+        item_success, item_message = add_items_to_sales_order(order_id, items_to_add)
 
-            if not order_id:
-                print(f"      Order {i + 1} ({order_number}): No ID found, skipping")
-                failed_updates += 1
-                continue
-
-            print(f"      Processing Order {i + 1} ({order_number}, ID: {order_id})...")
-
-            # Add items to this sales order
-            item_success, item_message = add_items_to_sales_order(order_id, items_to_add)
-
-            if item_success:
-                print(f"        SUCCESS: {item_message}")
-                successful_updates += 1
-                update_details.append(f"Order {order_number}: {item_message}")
-            else:
-                print(f"        ERROR: {item_message}")
-                failed_updates += 1
-                update_details.append(f"Order {order_number}: FAILED - {item_message}")
-
-        # Summary of updates
-        print(f"\n    Update Summary:")
-        print(f"      Successful updates: {successful_updates}")
-        print(f"      Failed updates: {failed_updates}")
-        print(f"      Total orders processed: {successful_updates + failed_updates}")
-        print(f"      Items processed per order: {len(items_to_add)}")
-
-        if update_details:
-            print(f"    Update Details:")
-            for detail in update_details:
-                print(f"      - {detail}")
-
-        # Determine overall success
-        if successful_updates > 0:
-            return True, None  # At least one update succeeded
-        elif failed_updates > 0:
-            return False, f"All {failed_updates} update attempts failed"
+        if item_success:
+            print(f"        SUCCESS: {item_message}")
+            return True, None
         else:
-            return False, "No orders were processed"
+            print(f"        ERROR: {item_message}")
+            return False, f"Failed to update order {order_number}: {item_message}"
 
     except Exception as e:
         print(f"  ERROR: Error searching/updating sales orders: {e}")
