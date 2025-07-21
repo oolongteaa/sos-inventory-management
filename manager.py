@@ -225,8 +225,8 @@ def extract_items_from_sheet_data(sheet_data, row_data):
             item_id_clean = str(item_id).strip()
 
             # Skip items with ID "000"
-            if item_id_clean == "000":
-                print(f"      Skipping item with ID '000' in column {col_index}")
+            if item_id_clean == "0":
+                print(f"      Skipping item with ID '0' in column {col_index}")
                 continue
 
             item_name_clean = str(item_name).strip() if item_name else f"Item {item_id_clean}"
