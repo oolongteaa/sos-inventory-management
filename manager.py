@@ -270,18 +270,15 @@ def extract_items_from_sheet_data(sheet_data, row_data):
 
             item_name_clean = str(item_name).strip() if item_name else f"Item {item_id_clean}"
 
-            # Check if this item has a sales price (force new line if it does)
-            force_new_line = False
+            # Always force new line to prevent combining with existing items
+            force_new_line = True
 
-            # Get item details to check for sales price
+            # Get item details to check for sales price (for informational purposes)
             if _sos_access_token:  # Make sure we have a token
                 price_success, item_details = sos_api.get_item_price_and_details(item_id_clean, _sos_access_token)
                 if price_success:
                     sales_price = item_details.get("price", 0.0)
-                    if sales_price > 0:
-                        force_new_line = True
-                        print(
-                            f"      Item {item_name_clean} (ID: {item_id_clean}) has sales price ${sales_price} - will force new line")
+                    print(f"      Item {item_name_clean} (ID: {item_id_clean}) has sales price ${sales_price} - will create new line")
                 else:
                     print(f"      Warning: Could not check sales price for item {item_id_clean}: {item_details}")
 
@@ -290,12 +287,11 @@ def extract_items_from_sheet_data(sheet_data, row_data):
                 "quantity": quantity,
                 "name": item_name_clean,
                 "column": col_index,
-                "force_new_line": force_new_line,
+                "force_new_line": force_new_line,  # Always True now
                 "row_date": row_date  # Include the parsed date
             })
 
-            print(f"      Found: {item_name_clean} (ID: {item_id_clean}) - Qty: {quantity}" +
-                  (" [NEW LINE]" if force_new_line else "") +
+            print(f"      Found: {item_name_clean} (ID: {item_id_clean}) - Qty: {quantity} [NEW LINE]" +
                   (f" [Date: {row_date}]" if row_date else " [Date: current]"))
 
         print(f"    [DEBUG] Total items to add: {len(items_to_add)}")
@@ -600,7 +596,7 @@ def validate_row_data(row_data):
 
 def add_items_to_sales_order(sales_order_id, items_to_add):
     """
-    Add items to a sales order in SOS Inventory
+    Add items to a sales order in SOS Inventory - ALWAYS creates new lines
 
     Parameters:
     - sales_order_id: The ID of the sales order
@@ -610,7 +606,7 @@ def add_items_to_sales_order(sales_order_id, items_to_add):
     - Tuple: (success, message)
     """
     try:
-        # Add each item to the sales order
+        # Add each item to the sales order with force_new_line=True
         successful_additions = []
         failed_additions = []
 
@@ -618,33 +614,31 @@ def add_items_to_sales_order(sales_order_id, items_to_add):
             item_id = item["item_id"]
             quantity = item["quantity"]
             item_name = item["name"]
-            force_new_line = item.get("force_new_line", False)
             row_date = item.get("row_date")  # Get the date from the item
 
-            print(f"        Adding item: {item_name} (ID: {item_id}) x {quantity}" +
-                  (" [FORCE NEW LINE]" if force_new_line else "") +
+            print(f"        Adding item as NEW LINE: {item_name} (ID: {item_id}) x {quantity}" +
                   (f" [Date: {row_date}]" if row_date else " [Date: current]"))
 
-            # Add item to sales order with the row date
+            # Add item to sales order with force_new_line=True to always create new lines
             success, result = sos_api.add_item_to_sales_order(
                 sales_order_id,
                 item_id,
                 quantity,
                 _sos_access_token,
-                force_new_line=force_new_line,
+                force_new_line=True,  # Always force new line to prevent quantity updates
                 line_date=row_date  # Pass the date from the row
             )
 
             if success:
                 successful_additions.append(f"{item_name} x{quantity}")
-                print(f"          SUCCESS: Added {item_name} x{quantity}")
+                print(f"          SUCCESS: Added {item_name} x{quantity} as NEW LINE")
             else:
                 failed_additions.append(f"{item_name} x{quantity}: {result}")
                 print(f"          ERROR: Failed to add {item_name} x{quantity} - {result}")
 
         # Summary
         if successful_additions:
-            success_msg = f"Added {len(successful_additions)} items: {', '.join(successful_additions)}"
+            success_msg = f"Added {len(successful_additions)} items as NEW LINES: {', '.join(successful_additions)}"
             if failed_additions:
                 fail_msg = f"Failed to add {len(failed_additions)} items: {', '.join(failed_additions)}"
                 return True, f"{success_msg}. {fail_msg}"
@@ -744,9 +738,9 @@ def search_and_update_sales_orders(row_data, search_string, items_to_add):
             print("  ERROR: Failed to obtain valid SOS Inventory access token")
             return False, "No access token"
 
-        print(f"  Items to add: {len(items_to_add)}")
+        print(f"  Items to add as NEW LINES: {len(items_to_add)}")
         for item in items_to_add:
-            print(f"    - {item['name']} (ID: {item['item_id']}) x {item['quantity']}")
+            print(f"    - {item['name']} (ID: {item['item_id']}) x {item['quantity']} [NEW LINE]")
 
         # Create search patterns for 1 and 2 spaces
         current_month = get_current_month_name()
@@ -817,7 +811,7 @@ def search_and_update_sales_orders(row_data, search_string, items_to_add):
             return False, "First order has no ID"
 
         print(f"\n    Processing first order only: {order_number} (ID: {order_id})...")
-        print(f"    Adding {len(items_to_add)} items to this sales order (with pricing)...")
+        print(f"    Adding {len(items_to_add)} items to this sales order as NEW LINES (preserving existing items)...")
 
         # Add items to this sales order
         item_success, item_message = add_items_to_sales_order(order_id, items_to_add)
@@ -868,6 +862,8 @@ def monitor_sheet():
     print("Handles new rows added to sheet dynamically")
     print("Searches for 'Done?' header in any row, then looks for 'Yes' values below it")
     print("Automatically retrieves and applies item pricing from SOS Inventory")
+    print("IMPORTANT: ALWAYS creates NEW LINES - never updates existing item quantities")
+    print("This preserves existing items and their dates while adding new entries with new dates")
     print("Press Ctrl+C to stop monitoring")
 
     prev_hash = None
@@ -935,6 +931,7 @@ def main():
     print("Handles new rows added dynamically and targets the first worksheet")
     print("Searches for 'Done?' header anywhere in sheet, processes 'Yes' values below it")
     print("Automatically retrieves and applies item pricing from SOS Inventory")
+    print("IMPORTANT: ALWAYS creates NEW LINES - preserves existing items and dates")
 
     print_separator("CONFIGURATION")
     print(f"Google Credentials: {GOOGLE_CREDENTIALS_FILE}")
@@ -958,8 +955,10 @@ def main():
     print("Duplicate Prevention: Uses row signatures to avoid reprocessing")
     print("Header Detection: Searches entire sheet for 'Done?' header, processes rows below it")
     print("Pricing: Automatically retrieves item selling prices from SOS Inventory API")
+    print("Line Behavior: ALWAYS creates NEW LINES - never updates existing item quantities")
+    print("Date Handling: Preserves existing item dates, applies new dates to new lines")
     print("Color coding:")
-    print("  - Light blue: Successful sales order search and item addition")
+    print("  - Light blue: Successful sales order search and item addition as new lines")
     print("  - Light red: Errors (SOS API failure, invalid data, no orders found, etc.)")
 
     # Start monitoring
