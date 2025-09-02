@@ -2,7 +2,7 @@
 """
 Google Sheets to SOS Inventory Integration
 Monitors a Google Sheet for completed rows, searches SOS Inventory sales orders
-using Column B value + current month (e.g., "HA 101 July"), and adds items from
+using Column B value + month from Column A date (e.g., "HA 101 July"), and adds items from
 the spreadsheet based on item IDs in row 1 and quantities in the processed row
 """
 
@@ -23,6 +23,7 @@ WORKSHEET_INDEX = 0  # Use the first worksheet (0-indexed)
 CHECK_INTERVAL = 10  # seconds between sheet checks
 DONE_COLUMN_NAME = "Done?"  # case-insensitive column name to monitor
 SEARCH_COLUMN = "B"  # Column B contains the search string for sales orders
+DATE_COLUMN = "A"  # Column A contains the creation date
 
 # Row configuration for spreadsheet structure
 ITEM_ID_ROW = 0  # Row 1 (0-indexed) contains item IDs
@@ -57,28 +58,86 @@ def print_separator(title=""):
         print("=" * 60)
 
 
-def get_current_month_name():
-    """Get the current month name (e.g., 'July', 'December')"""
-    return datetime.now().strftime("%B")
-
-
-def build_search_string(column_b_value):
+def parse_month_from_date(date_string):
     """
-    Build search string from column B value + current month
+    Parse month name from a date string in column A
+
+    Parameters:
+    - date_string: Date string from column A
+
+    Returns:
+    - Month name (e.g., "July", "September") or None if parsing fails
+    """
+    if not date_string or date_string.strip() == "":
+        print(f"    [DEBUG] Empty date string provided")
+        return None
+
+    try:
+        date_str = str(date_string).strip()
+        print(f"    [DEBUG] Parsing month from date: '{date_str}'")
+
+        # Remove any time portion if present
+        date_part = date_str.split(' ')[0] if ' ' in date_str else date_str
+
+        # Try different date formats
+        date_formats = [
+            "%Y-%m-%d",  # 2024-01-15
+            "%m/%d/%Y",  # 1/15/2024 or 01/15/2024
+            "%d/%m/%Y",  # 15/1/2024 or 15/01/2024
+            "%m-%d-%Y",  # 1-15-2024 or 01-15-2024
+            "%d-%m-%Y",  # 15-1-2024 or 15-01-2024
+            "%Y/%m/%d",  # 2024/01/15
+            "%d/%m/%y",  # 15/1/24 or 15/01/24
+            "%m/%d/%y",  # 1/15/24 or 01/15/24
+        ]
+
+        parsed_date = None
+        for fmt in date_formats:
+            try:
+                parsed_date = datetime.strptime(date_part, fmt)
+                print(f"    [DEBUG] Successfully parsed with format '{fmt}': {parsed_date}")
+                break
+            except ValueError:
+                continue
+
+        if parsed_date:
+            month_name = parsed_date.strftime("%B")  # Full month name (e.g., "July")
+            print(f"    [DEBUG] Extracted month: '{month_name}'")
+            return month_name
+        else:
+            print(f"    [DEBUG] Could not parse date '{date_str}' with any known format")
+            return None
+
+    except Exception as e:
+        print(f"    [DEBUG] Error parsing date '{date_string}': {e}")
+        return None
+
+
+def build_search_string(column_b_value, column_a_date):
+    """
+    Build search string from column B value + month from column A date
 
     Parameters:
     - column_b_value: Value from column B of the Google Sheet
+    - column_a_date: Date value from column A of the Google Sheet
 
     Returns:
-    - Search string in format "column_b_value current_month"
+    - Search string in format "column_b_value month_from_date"
     """
     if not column_b_value:
-        return None
+        print("    [DEBUG] No column B value provided")
+        return None, None
 
-    current_month = get_current_month_name()
+    # Extract month from column A date
+    month_name = parse_month_from_date(column_a_date)
+    if not month_name:
+        print(f"    [DEBUG] Could not extract month from column A date: '{column_a_date}'")
+        return None, None
+
     search_string = column_b_value.strip()
+    print(f"    [DEBUG] Built search components - Base: '{search_string}', Month: '{month_name}'")
 
-    return search_string
+    return search_string, month_name
 
 
 def find_done_column(data):
@@ -278,7 +337,8 @@ def extract_items_from_sheet_data(sheet_data, row_data):
                 price_success, item_details = sos_api.get_item_price_and_details(item_id_clean, _sos_access_token)
                 if price_success:
                     sales_price = item_details.get("price", 0.0)
-                    print(f"      Item {item_name_clean} (ID: {item_id_clean}) has sales price ${sales_price} - will create new line")
+                    print(
+                        f"      Item {item_name_clean} (ID: {item_id_clean}) has sales price ${sales_price} - will create new line")
                 else:
                     print(f"      Warning: Could not check sales price for item {item_id_clean}: {item_details}")
 
@@ -566,6 +626,20 @@ def get_column_b_value(row_data):
         return None
 
 
+def get_column_a_value(row_data):
+    """Extract the value from column A (index 0)"""
+    try:
+        data = row_data.get('data', [])
+        if len(data) > 0:  # Column A is index 0
+            return data[0].strip()
+        else:
+            print(f"WARNING: Row {row_data['row_number']} doesn't have a column A value")
+            return None
+    except Exception as e:
+        print(f"ERROR: Error extracting column A value from row {row_data['row_number']}: {e}")
+        return None
+
+
 def validate_row_data(row_data):
     """Validate that row data can be processed"""
     try:
@@ -576,9 +650,15 @@ def validate_row_data(row_data):
             print(f"ERROR: No data found for row {row_data['row_number']}")
             return False
 
-        # Check if we have at least column B (index 1)
+        # Check if we have at least columns A and B
         if len(data) < 2:
-            print(f"ERROR: Row {row_data['row_number']} doesn't have enough columns (need at least B)")
+            print(f"ERROR: Row {row_data['row_number']} doesn't have enough columns (need at least A and B)")
+            return False
+
+        # Check if column A has meaningful data (date)
+        column_a_value = get_column_a_value(row_data)
+        if not column_a_value:
+            print(f"ERROR: Row {row_data['row_number']} has empty or invalid column A value (date)")
             return False
 
         # Check if column B has meaningful data
@@ -651,6 +731,7 @@ def add_items_to_sales_order(sales_order_id, items_to_add):
     except Exception as e:
         return False, f"Exception adding items to sales order: {str(e)}"
 
+
 def process_completed_row(row_data):
     """Process a newly completed row by searching SOS Inventory sales orders and adding items from spreadsheet"""
     global _sheet_instance, _sheet_data_cache
@@ -676,18 +757,20 @@ def process_completed_row(row_data):
                     header = headers[i] if i < len(headers) else f"Column {chr(65 + i)}"
                     print(f"  {header}: {value}")
 
-            # Get the search string from column B + current month
+            # Get the search string from column B + month from column A date
             column_b_value = get_column_b_value(row_data)
-            search_string = build_search_string(column_b_value)
+            column_a_date = get_column_a_value(row_data)
 
-            if not search_string:
-                error_reason = "Could not build search string from column B"
+            search_components = build_search_string(column_b_value, column_a_date)
+            if not search_components[0] or not search_components[1]:
+                error_reason = "Could not build search string from columns A and B"
                 success = False
             else:
-                current_month = get_current_month_name()
-                print(f"\nColumn B value: '{column_b_value}'")
-                print(f"Current month: '{current_month}'")
-                print(f"Search patterns: '{column_b_value} {current_month}' and '{column_b_value}  {current_month}'")
+                search_string, order_month = search_components
+                print(f"\nColumn A date: '{column_a_date}'")
+                print(f"Column B value: '{column_b_value}'")
+                print(f"Extracted month: '{order_month}'")
+                print(f"Search patterns: '{column_b_value} {order_month}' and '{column_b_value}  {order_month}'")
 
                 # Extract items from the sheet data
                 if not _sheet_data_cache:
@@ -702,7 +785,8 @@ def process_completed_row(row_data):
                         error_reason = None
                     else:
                         # Search SOS Inventory for sales orders and add items
-                        success, error_reason = search_and_update_sales_orders(row_data, search_string, items_to_add)
+                        success, error_reason = search_and_update_sales_orders(row_data, search_string, order_month,
+                                                                               items_to_add)
 
     except Exception as e:
         print(f"ERROR: Exception while processing row {row_data['row_number']}: {e}")
@@ -728,7 +812,7 @@ def process_completed_row(row_data):
     return success
 
 
-def search_and_update_sales_orders(row_data, search_string, items_to_add):
+def search_and_update_sales_orders(row_data, search_string, order_month, items_to_add):
     """Search SOS Inventory sales orders and add items from spreadsheet to found orders"""
     print(f"Searching SOS Inventory sales orders for row {row_data['row_number']}...")
 
@@ -742,11 +826,10 @@ def search_and_update_sales_orders(row_data, search_string, items_to_add):
         for item in items_to_add:
             print(f"    - {item['name']} (ID: {item['item_id']}) x {item['quantity']} [NEW LINE]")
 
-        # Create search patterns for 1 and 2 spaces
-        current_month = get_current_month_name()
+        # Create search patterns for 1 and 2 spaces using the month from column A
         search_patterns = [
-            f"{search_string} {current_month}",  # 1 space
-            f"{search_string}  {current_month}"  # 2 spaces
+            f"{search_string} {order_month}",  # 1 space
+            f"{search_string}  {order_month}"  # 2 spaces
         ]
 
         all_orders = []
@@ -842,16 +925,14 @@ def monitor_sheet():
     if not setup_sos_inventory():
         return False
 
-    current_month = get_current_month_name()
-
     print(f"\nStarting sheet monitoring...")
     print(f"Sheet ID: {GOOGLE_SHEET_ID}")
     print(f"Worksheet: '{sheet.title}' (index {WORKSHEET_INDEX})")
     print(f"Check interval: {CHECK_INTERVAL} seconds")
     print(f"Monitoring column: '{DONE_COLUMN_NAME}' (will search entire sheet for this header)")
     print(f"Search column: {SEARCH_COLUMN}")
-    print(f"Current month: {current_month}")
-    print(f"Search format: '[Column B Value] {current_month}' (e.g., 'HA 101 {current_month}')")
+    print(f"Date column: {DATE_COLUMN}")
+    print(f"Search format: '[Column B Value] [Month from Column A Date]' (e.g., 'HA 101 September')")
     print(f"Item processing: Extract from spreadsheet using item IDs in row 1")
     print("Will search SOS Inventory sales orders and add items from spreadsheet when new rows are completed")
     print("Uses OAuth2 Bearer token authentication with automatic token refresh")
@@ -864,6 +945,7 @@ def monitor_sheet():
     print("Automatically retrieves and applies item pricing from SOS Inventory")
     print("IMPORTANT: ALWAYS creates NEW LINES - never updates existing item quantities")
     print("This preserves existing items and their dates while adding new entries with new dates")
+    print("Month extraction: Uses date from Column A to determine sales order month")
     print("Press Ctrl+C to stop monitoring")
 
     prev_hash = None
@@ -922,8 +1004,6 @@ def monitor_sheet():
 
 def main():
     """Main function"""
-    current_month = get_current_month_name()
-
     print("Google Sheets to SOS Inventory Integration (Sales Order Search + Spreadsheet Item Addition)")
     print("This will monitor your Google Sheet, search SOS Inventory sales orders,")
     print("and add items from the spreadsheet based on item IDs and quantities")
@@ -932,6 +1012,7 @@ def main():
     print("Searches for 'Done?' header anywhere in sheet, processes 'Yes' values below it")
     print("Automatically retrieves and applies item pricing from SOS Inventory")
     print("IMPORTANT: ALWAYS creates NEW LINES - preserves existing items and dates")
+    print("Month Detection: Uses date from Column A to determine sales order month")
 
     print_separator("CONFIGURATION")
     print(f"Google Credentials: {GOOGLE_CREDENTIALS_FILE}")
@@ -939,12 +1020,12 @@ def main():
     print(f"Target Worksheet: First worksheet (index {WORKSHEET_INDEX})")
     print(f"Monitoring Column: {DONE_COLUMN_NAME} (searches entire sheet for this header)")
     print(f"Search Column: {SEARCH_COLUMN}")
-    print(f"Current Month: {current_month}")
+    print(f"Date Column: {DATE_COLUMN} (used to extract month for sales order search)")
     print(f"Item ID Row: {ITEM_ID_ROW + 1} (Row 1)")
     print(f"Item Name Row: {ITEM_NAME_ROW + 1} (Row 2)")
     print(f"Check Interval: {CHECK_INTERVAL} seconds")
     print("Mode: Sales Order Search + Spreadsheet Item Addition via GET/PUT")
-    print("Search Pattern: [Column B] + [Current Month]")
+    print("Search Pattern: [Column B] + [Month from Column A Date]")
     print("Item Action: Add items from spreadsheet based on item IDs and quantities")
     print("Method: GET sales order → modify lines → PUT sales order → verify result")
     print("Authentication: OAuth2 Bearer token with automatic refresh")
@@ -957,6 +1038,7 @@ def main():
     print("Pricing: Automatically retrieves item selling prices from SOS Inventory API")
     print("Line Behavior: ALWAYS creates NEW LINES - never updates existing item quantities")
     print("Date Handling: Preserves existing item dates, applies new dates to new lines")
+    print("Month Extraction: Parses Column A date to determine sales order month (e.g., 'HW September')")
     print("Color coding:")
     print("  - Light blue: Successful sales order search and item addition as new lines")
     print("  - Light red: Errors (SOS API failure, invalid data, no orders found, etc.)")
