@@ -115,15 +115,10 @@ def parse_month_from_date(date_string):
 
 def build_search_string(column_b_value, column_a_date):
     """
-    Build search string from column B value + month from column A date
-
-    Parameters:
-    - column_b_value: Value from column B of the Google Sheet
-    - column_a_date: Date value from column A of the Google Sheet
-
-    Returns:
-    - Search string in format "column_b_value month_from_date"
+    Build search string from column B value + month from column A date.
+    Generates both full month and abbreviated month (e.g., "October" and "Oct").
     """
+
     if not column_b_value:
         print("    [DEBUG] No column B value provided")
         return None, None
@@ -134,10 +129,15 @@ def build_search_string(column_b_value, column_a_date):
         print(f"    [DEBUG] Could not extract month from column A date: '{column_a_date}'")
         return None, None
 
-    search_string = column_b_value.strip()
-    print(f"    [DEBUG] Built search components - Base: '{search_string}', Month: '{month_name}'")
+    # Get abbreviated month (first 3 letters, capitalized correctly)
+    month_abbrev = month_name[:3] if len(month_name) >= 3 else month_name
+    month_abbrev = month_abbrev.title()  # e.g., "Oct"
 
-    return search_string, month_name
+    search_string = column_b_value.strip()
+    print(f"    [DEBUG] Built search components - Base: '{search_string}', Full month: '{month_name}', Short month: '{month_abbrev}'")
+
+    # Return both full and abbreviated month names
+    return search_string, (month_name, month_abbrev)
 
 
 def find_done_column(data):
@@ -733,60 +733,73 @@ def add_items_to_sales_order(sales_order_id, items_to_add):
 
 
 def process_completed_row(row_data):
-    """Process a newly completed row by searching SOS Inventory sales orders and adding items from spreadsheet"""
+    """Process a newly completed row — searches SOS orders and adds items (full + short month support)."""
     global _sheet_instance, _sheet_data_cache
 
     print(f"\nProcessing Row {row_data['row_number']}:")
 
     success = False
     error_reason = None
+    items_to_add = []  # Ensure defined to prevent reference errors
 
     try:
-        # First validate the row data
+        # 1️⃣ Validate the row first
         if not validate_row_data(row_data):
-            error_reason = "Invalid row data"
-            success = False
+            error_reason = "Invalid row data (missing or bad columns)"
+            raise ValueError(error_reason)
+
+        # 2️⃣ Extract basic info
+        column_a_date = get_column_a_value(row_data)
+        column_b_value = get_column_b_value(row_data)
+
+        print(f"  Column A (date): {column_a_date}")
+        print(f"  Column B (property/ID): {column_b_value}")
+
+        # 3️⃣ Build search strings (supports full + abbreviated month)
+        search_components = build_search_string(column_b_value, column_a_date)
+        if not search_components or not search_components[0] or not search_components[1]:
+            error_reason = "Could not build search string (missing column values)"
+            raise ValueError(error_reason)
+
+        search_string, month_tuple = search_components
+        full_month, short_month = month_tuple
+        print(f"  Month variants: {full_month} / {short_month}")
+        print(f"  Search patterns will include both variants.")
+
+        # 4️⃣ Extract items
+        if not _sheet_data_cache:
+            error_reason = "No sheet data cache available"
+            raise ValueError(error_reason)
+
+        items_to_add = extract_items_from_sheet_data(_sheet_data_cache, row_data)
+        if not items_to_add:
+            print("  No items found to add — marking as successful.")
+            color_row(_sheet_instance, row_data['row_number'], "success")
+            return True
+
+        # 5️⃣ Search and update SOS Inventory orders
+        success, message = search_and_update_sales_orders(
+            row_data,
+            search_string,
+            month_tuple,
+            items_to_add
+        )
+
+        if success:
+            print(f"SUCCESS: Row {row_data['row_number']}: {message}")
+            color_row(_sheet_instance, row_data['row_number'], "success")
         else:
-            # Display the row data
-            data = row_data['data']
-            headers = row_data.get('headers', [])
+            print(f"ERROR: Row {row_data['row_number']}: {message}")
+            color_row(_sheet_instance, row_data['row_number'], "error")
 
-            print("Row contents:")
-            for i, value in enumerate(data):
-                if value.strip():  # Only show non-empty values
-                    header = headers[i] if i < len(headers) else f"Column {chr(65 + i)}"
-                    print(f"  {header}: {value}")
+        return success
 
-            # Get the search string from column B + month from column A date
-            column_b_value = get_column_b_value(row_data)
-            column_a_date = get_column_a_value(row_data)
-
-            search_components = build_search_string(column_b_value, column_a_date)
-            if not search_components[0] or not search_components[1]:
-                error_reason = "Could not build search string from columns A and B"
-                success = False
-            else:
-                search_string, order_month = search_components
-                print(f"\nColumn A date: '{column_a_date}'")
-                print(f"Column B value: '{column_b_value}'")
-                print(f"Extracted month: '{order_month}'")
-                print(f"Search patterns: '{column_b_value} {order_month}' and '{column_b_value}  {order_month}'")
-
-                # Extract items from the sheet data
-                if not _sheet_data_cache:
-                    error_reason = "No sheet data available for item extraction"
-                    success = False
-                else:
-                    items_to_add = extract_items_from_sheet_data(_sheet_data_cache, row_data)
-
-                    if not items_to_add:
-                        print("No items found to add from this row (after skipping items with ID '0')")
-                        success = True  # Treat as success - color blue
-                        error_reason = None
-                    else:
-                        # Search SOS Inventory for sales orders and add items
-                        success, error_reason = search_and_update_sales_orders(row_data, search_string, order_month,
-                                                                               items_to_add)
+    except Exception as e:
+        # Catch any errors (including missing local vars)
+        print(f"ERROR: Exception while processing row {row_data.get('row_number','?')}: {e}")
+        if _sheet_instance:
+            color_row(_sheet_instance, row_data['row_number'], "error")
+        return False
 
     except Exception as e:
         print(f"ERROR: Exception while processing row {row_data['row_number']}: {e}")
@@ -812,8 +825,10 @@ def process_completed_row(row_data):
     return success
 
 
-def search_and_update_sales_orders(row_data, search_string, order_month, items_to_add):
-    """Search SOS Inventory sales orders and add items from spreadsheet to found orders"""
+def search_and_update_sales_orders(row_data, search_string, month_tuple, items_to_add):
+    """Search SOS Inventory sales orders and add items from spreadsheet to found orders.
+       Supports both full and abbreviated month names (e.g., 'October' and 'Oct').
+    """
     print(f"Searching SOS Inventory sales orders for row {row_data['row_number']}...")
 
     try:
@@ -822,20 +837,23 @@ def search_and_update_sales_orders(row_data, search_string, order_month, items_t
             print("  ERROR: Failed to obtain valid SOS Inventory access token")
             return False, "No access token"
 
+        full_month, short_month = month_tuple
+
         print(f"  Items to add as NEW LINES: {len(items_to_add)}")
         for item in items_to_add:
             print(f"    - {item['name']} (ID: {item['item_id']}) x {item['quantity']} [NEW LINE]")
 
-        # Create search patterns for 1 and 2 spaces using the month from column A
+        # Try both full and abbreviated month patterns with single or double space
         search_patterns = [
-            f"{search_string} {order_month}",  # 1 space
-            f"{search_string}  {order_month}"  # 2 spaces
+            f"{search_string} {full_month}",
+            f"{search_string}  {full_month}",
+            f"{search_string} {short_month}",
+            f"{search_string}  {short_month}"
         ]
 
         all_orders = []
         orders_found_by_pattern = {}
 
-        # Search with each pattern
         for i, pattern in enumerate(search_patterns):
             print(f"  Trying pattern {i + 1}: '{pattern}'...")
 
@@ -852,7 +870,6 @@ def search_and_update_sales_orders(row_data, search_string, order_month, items_t
                     orders_found_by_pattern[pattern] = len(orders)
                     print(f"    Found {len(orders)} orders with pattern '{pattern}'")
 
-                    # Add unique orders (avoid duplicates)
                     for order in orders:
                         if not any(existing_order.get("id") == order.get("id") for existing_order in all_orders):
                             all_orders.append(order)
@@ -866,25 +883,23 @@ def search_and_update_sales_orders(row_data, search_string, order_month, items_t
         total_count = len(all_orders)
         print(f"    Total unique orders found: {total_count}")
 
-        # Show breakdown by pattern
         for pattern, count in orders_found_by_pattern.items():
             if count > 0:
                 print(f"      '{pattern}': {count} orders")
 
         if not all_orders:
-            print(f"    No sales orders found with either spacing pattern")
+            print(f"    No sales orders found with any month variant (full or short)")
             return False, "No sales orders found"
 
-        # Display the matching orders
+        # Display matching orders
         print("    Matching sales orders:")
-        for i, order in enumerate(all_orders[:10]):  # Show first 10 matches
+        for i, order in enumerate(all_orders[:10]):  # Show first 10
             summary = sos_api.format_sales_order_summary(order)
             print(f"      {i + 1}. {summary}")
 
         if len(all_orders) > 10:
             print(f"      ... and {len(all_orders) - 10} more orders")
 
-        # Process only the first found sales order
         first_order = all_orders[0]
         order_id = first_order.get("id")
         order_number = first_order.get("number", "Unknown")
@@ -894,9 +909,9 @@ def search_and_update_sales_orders(row_data, search_string, order_month, items_t
             return False, "First order has no ID"
 
         print(f"\n    Processing first order only: {order_number} (ID: {order_id})...")
-        print(f"    Adding {len(items_to_add)} items to this sales order as NEW LINES (preserving existing items)...")
+        print(f"    Adding {len(items_to_add)} items to this sales order as NEW LINES...")
 
-        # Add items to this sales order
+        # Add items
         item_success, item_message = add_items_to_sales_order(order_id, items_to_add)
 
         if item_success:
@@ -909,7 +924,6 @@ def search_and_update_sales_orders(row_data, search_string, order_month, items_t
     except Exception as e:
         print(f"  ERROR: Error searching/updating sales orders: {e}")
         return False, f"Exception: {str(e)}"
-
 
 def monitor_sheet():
     """Main monitoring loop"""
