@@ -1,6 +1,7 @@
 import requests
 import json
 from datetime import datetime
+from copy import deepcopy
 
 API_BASE_URL = "https://api.sosinventory.com/api/v2"
 
@@ -39,7 +40,12 @@ def get_item_by_id(item_id, access_token):
     return make_request("GET", f"/item/{item_id}", access_token)
 
 
-def make_request(method, endpoint, access_token, data=None, params=None):
+def make_request(method, endpoint, access_token, data=None, params=None, json=None):
+    """
+    Minimal change: keep existing behavior, but allow json= for POST/PUT.
+    - If json is provided, send it as the JSON body.
+    - Else, fall back to existing data argument (sent as JSON to preserve prior behavior).
+    """
     if not access_token:
         return False, "No access token provided"
 
@@ -55,13 +61,23 @@ def make_request(method, endpoint, access_token, data=None, params=None):
     print(f"[HTTP DEBUG] ===== HTTP REQUEST =====")
     print(f"[HTTP DEBUG] Method: {method}")
     print(f"[HTTP DEBUG] URL: {url}")
-    print(f"[HTTP DEBUG] Token (first 20 chars): {access_token[:20]}..." if access_token else "No token")
+    print(f"[HTTP DEBUG] Params: {params}")
 
     try:
-        if method.upper() == "GET":
+        method_upper = method.upper()
+        if method_upper == "GET":
             response = requests.get(url, headers=headers, params=params, timeout=30)
-        elif method.upper() == "PUT":
-            response = requests.put(url, headers=headers, json=data, timeout=30)
+        elif method_upper == "PUT":
+            # Prefer json if provided, else use data (as JSON to match previous behavior)
+            if json is not None:
+                response = requests.put(url, headers=headers, params=params, json=json, timeout=30)
+            else:
+                response = requests.put(url, headers=headers, params=params, json=data, timeout=30)
+        elif method_upper == "POST":
+            if json is not None:
+                response = requests.post(url, headers=headers, params=params, json=json, timeout=30)
+            else:
+                response = requests.post(url, headers=headers, params=params, json=data, timeout=30)
         else:
             raise ValueError(f"Unsupported HTTP method: {method}")
 
@@ -288,7 +304,7 @@ def add_item_to_sales_order(sales_order_id, item_id, quantity, access_token, for
                         new_amount = calculate_line_amount(new_quantity, unit_price)
                         lines[existing_line_index]["amount"] = new_amount
                         print(
-                            f"Updated existing line: quantity {current_quantity} -> {new_quantity}, amount -> ${new_amount}, due date {current_due_date} -> {due_date} (price unchanged: ${current_price_float})")
+                            f"Updated existing line: quantity {current_quantity} -> {new_quantity}, amount -> ${new_amount}, due date {current_due_date} -> {due_date} (price unchanged: ${unit_price})")
                 except (ValueError, TypeError):
                     # If current price is invalid, update it
                     lines[existing_line_index]["unitprice"] = unit_price
@@ -578,3 +594,281 @@ def format_sales_order_summary(sales_order):
         return f"Order #{number} - {customer_name} - ${total} - {date}"
     except Exception:
         return "Unable to format sales order"
+
+
+def get_shipments(access_token, params=None):
+    return make_request("GET", "/shipment", access_token, params=params)
+
+
+def parse_shipment_response(result):
+    if not isinstance(result, dict):
+        return None
+
+    status = result.get("status") or result.get("Status")
+    message = result.get("message")
+
+    if "data" in result and isinstance(result["data"], list):
+        data = result["data"]
+        return {
+            "status": status or "ok",
+            "count": result.get("count", len(data)),
+            "total_count": result.get("totalCount", len(data)),
+            "shipments": [normalize_shipment_shape(s) for s in data],
+            "message": message,
+        }
+
+    if "id" in result and isinstance(result.get("lines"), list):
+        return {
+            "status": status or "ok",
+            "count": 1,
+            "total_count": 1,
+            "shipments": [normalize_shipment_shape(result)],
+            "message": message,
+        }
+
+    if isinstance(result.get("data"), dict) and "id" in result["data"]:
+        sh = result["data"]
+        return {
+            "status": status or "ok",
+            "count": 1,
+            "total_count": 1,
+            "shipments": [normalize_shipment_shape(sh)],
+            "message": message,
+        }
+
+    return None
+
+
+def normalize_shipment_shape(sh):
+    if not isinstance(sh, dict):
+        return {}
+
+    sh = deepcopy(sh)
+
+    defaults = {
+        "id": None, "starred": 0, "syncToken": 0, "number": "", "date": None, "customer": None, "location": None,
+        "billing": None, "shipping": None, "channel": None, "department": None, "priority": None,
+        "assignedToUser": None, "shippingMethod": None, "trackingNumber": None, "linkedTransaction": None,
+        "customerMessage": None, "comment": None, "customerNotes": "", "customFields": None, "customerPO": None,
+        "shipBy": None, "shippingAmount": 0.0, "total": 0.0, "forceToShipStation": False, "archived": False,
+        "summaryOnly": False, "hasSignature": False, "trackingLink": "", "keys": None, "values": None, "lines": [],
+    }
+    for k, v in defaults.items():
+        sh.setdefault(k, v)
+
+    if isinstance(sh.get("customer"), dict):
+        sh["customer"].setdefault("id", None)
+        sh["customer"].setdefault("name", None)
+    if isinstance(sh.get("location"), dict):
+        sh["location"].setdefault("id", None)
+        sh["location"].setdefault("name", None)
+
+    def ensure_addr(block):
+        if not isinstance(block, dict):
+            return {
+                "company": None, "contact": None, "phone": None, "email": None, "addressName": "", "addressType": "",
+                "address": {
+                    "line1": None, "line2": None, "line3": None, "line4": None, "line5": None,
+                    "city": None, "stateProvince": None, "postalCode": None, "country": None
+                },
+            }
+        block.setdefault("company", None)
+        block.setdefault("contact", None)
+        block.setdefault("phone", None)
+        block.setdefault("email", None)
+        block.setdefault("addressName", "")
+        block.setdefault("addressType", "")
+        addr = block.get("address") or {}
+        block["address"] = {
+            "line1": addr.get("line1"), "line2": addr.get("line2"), "line3": addr.get("line3"),
+            "line4": addr.get("line4"), "line5": addr.get("line5"), "city": addr.get("city"),
+            "stateProvince": addr.get("stateProvince"), "postalCode": addr.get("postalCode"),
+            "country": addr.get("country"),
+        }
+        return block
+
+    sh["billing"] = ensure_addr(sh.get("billing"))
+    sh["shipping"] = ensure_addr(sh.get("shipping"))
+
+    norm_lines = []
+    for ln in sh.get("lines") or []:
+        if not isinstance(ln, dict):
+            continue
+        ln = deepcopy(ln)
+        ln_defaults = {
+            "id": None, "lineNumber": None, "item": None, "class": None, "job": None, "workcenter": None, "tax": None,
+            "linkedTransaction": None, "description": None, "quantity": 0.0, "weight": 0.0, "volume": 0.0,
+            "weightunit": "lb", "volumeunit": "cbm", "unitprice": 0.0, "amount": 0.0, "altAmount": 0.0,
+            "picked": 0.0, "shipped": 0.0, "invoiced": 0.0, "produced": 0.0, "returned": 0.0, "cost": None,
+            "margin": None, "listprice": 0.0, "percentdiscount": 0.0, "backOrdered": 0.0, "duedate": "",
+            "uom": None, "bin": None, "lot": None, "serials": None,
+        }
+        for k, v in ln_defaults.items():
+            ln.setdefault(k, v)
+
+        if isinstance(ln.get("item"), dict):
+            ln["item"].setdefault("id", None)
+            ln["item"].setdefault("name", None)
+
+        if isinstance(ln.get("linkedTransaction"), dict):
+            lt = ln["linkedTransaction"]
+            lt.setdefault("id", None)
+            lt.setdefault("transactionType", None)
+            lt.setdefault("refNumber", None)
+            lt.setdefault("lineNumber", None)
+
+        norm_lines.append(ln)
+
+    sh["lines"] = norm_lines
+
+    return sh
+
+
+# FIXED: Helper function to correctly build address blocks.
+def _build_shipment_address_block(addr_data):
+    """Builds a valid address block from a dictionary."""
+    if not addr_data or not isinstance(addr_data, dict):
+        return {
+            "company": None, "contact": None, "phone": None, "email": None,
+            "addressName": "", "addressType": "",
+            "address": {
+                "line1": None, "line2": None, "line3": None, "line4": None, "line5": None,
+                "city": None, "stateProvince": None, "postalCode": None, "country": None
+            }
+        }
+
+    addr = addr_data.get("address", {})
+    return {
+        "company": addr_data.get("company"), "contact": addr_data.get("contact"),
+        "phone": addr_data.get("phone"), "email": addr_data.get("email"),
+        "addressName": addr_data.get("addressName", ""), "addressType": addr_data.get("addressType", ""),
+        "address": {
+            "line1": addr.get("line1"), "line2": addr.get("line2"), "line3": addr.get("line3"),
+            "line4": addr.get("line4"), "line5": addr.get("line5"), "city": addr.get("city"),
+            "stateProvince": addr.get("stateProvince"), "postalCode": addr.get("postalCode"),
+            "country": addr.get("country"),
+        }
+    }
+
+
+def build_fully_filled_shipment(
+    *,
+    number,
+    date,
+    ship_by,
+    customer_id,
+    location_id,
+    lines,
+    customer_name=None,
+    location_name=None,
+    billing_address=None,
+    shipping_address=None,
+    header_linked_tx=None,
+    shipping_method_id=None,
+    department_id=None,
+    channel_id=None,
+    priority=None,
+    assigned_user_id=None,
+    customer_message=None,
+    comment=None,
+    customer_po=None,
+    shipping_amount=0.0,
+):
+    """
+    Build a 'full' shipment object with explicit values for all writable fields.
+    Does NOT include any 'id' fields at header or line per SOS rules.
+    You must supply all values you care about.
+    """
+    payload = {
+        "starred": 0, "syncToken": 0, "number": number or "", "date": date,
+        "customer": {"id": customer_id, **({"name": customer_name} if customer_name else {})},
+        "location": {"id": location_id, **({"name": location_name} if location_name else {})},
+        "billing": _build_shipment_address_block(billing_address),
+        "shipping": _build_shipment_address_block(shipping_address),
+        "channel": {"id": channel_id} if channel_id else None,
+        "department": {"id": department_id} if department_id else None,
+        "priority": priority,
+        "assignedToUser": {"id": assigned_user_id} if assigned_user_id else None,
+        "shippingMethod": {"id": shipping_method_id} if shipping_method_id else None,
+        "trackingNumber": None,
+        "linkedTransaction": (
+            {k: v for k, v in (header_linked_tx or {}).items() if k in ("id", "transactionType", "refNumber")}
+            if header_linked_tx else None
+        ),
+        "customerMessage": customer_message, "comment": comment, "customerNotes": "",
+        "customFields": None, "customerPO": customer_po, "shipBy": ship_by or "",
+        "shippingAmount": float(shipping_amount or 0), "forceToShipStation": False,
+        "archived": False, "summaryOnly": False, "hasSignature": False, "trackingLink": "",
+        "keys": None, "values": None,
+        # FIXED: Added missing fields from working payload
+        "orderStage": None, "taxCode": None, "total": 0,
+        "lines": [],
+    }
+
+    # Build lines with explicit fields
+    for i, ln in enumerate(lines, 1):
+        line_payload = {
+            "lineNumber": i,  # FIXED: Add lineNumber, starting from 1
+            "item": {"id": ln["item_id"]},
+            "class": ({"id": ln["class_id"]} if ln.get("class_id") else None),
+            "job": ({"id": ln["job_id"]} if ln.get("job_id") else None),
+            "workcenter": None, "tax": None,
+            "linkedTransaction": (
+                {k: v for k, v in ln.get("line_linked_tx", {}).items()
+                 if k in ("id", "transactionType", "refNumber", "lineNumber")}
+                if ln.get("line_linked_tx") else None
+            ),
+            "description": ln.get("description"),
+            "quantity": float(ln.get("quantity", 0)),
+            "weight": 0.0, "volume": 0.0, "weightunit": "lb", "volumeunit": "cbm",
+            "unitprice": float(ln.get("unitprice", 0)),
+            "amount": float(ln.get("amount", 0)),
+            "altAmount": 0, "picked": 0, "shipped": 0, "invoiced": 0, "produced": 0, "returned": 0,
+            "cost": None, "margin": None,
+            "listprice": float(ln.get("listprice", 0)),  # FIXED: Corrected key and default
+            "percentdiscount": float(ln.get("percentdiscount", 0)),  # FIXED: Corrected default
+            "backOrdered": 0.0,
+            "duedate": ln.get("duedate"),  # FIXED: Default to None if not present
+            "uom": ({"id": ln["uom_id"]} if ln.get("uom_id") else None),
+            "bin": None, "lot": None,
+            "serials": None,  # FIXED: Default to None
+        }
+        payload["lines"].append(line_payload)
+
+    return payload
+
+
+# FIXED: This function is modified to correctly handle the payload.
+def create_shipment(payload, access_token, sanitize=True):
+    """
+    POST /shipment with a fully filled payload.
+    - Sanitizes forbidden ids (header/lines) if present.
+    - Ensures date strings include time.
+    - Sends via json=.
+    - Returns normalized shipment when possible.
+    """
+    body = deepcopy(payload)
+
+    if sanitize:
+        # Must not include shipment id on create
+        body.pop("id", None)
+        # Must not include line ids on create
+        if isinstance(body.get("lines"), list):
+            for ln in body["lines"]:
+                if isinstance(ln, dict):
+                    ln.pop("id", None)
+                    # FIXED: DO NOT remove lineNumber. The API expects it on create.
+
+    # Ensure dates include time if only YYYY-MM-DD provided
+    for key in ("date", "shipBy"):
+        if key in body and isinstance(body[key], str) and len(body[key]) == 10 and "T" not in body[key]:
+            body[key] = f"{body[key]}T00:00:00"
+
+    success, result = make_request("POST", "/shipment", access_token, params=None, json=body)
+    if not success:
+        return False, result
+
+    parsed = parse_shipment_response(result)
+    if parsed and parsed.get("shipments"):
+        return True, parsed["shipments"][0]
+    return True, result
