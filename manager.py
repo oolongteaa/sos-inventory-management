@@ -49,8 +49,8 @@ SHEET_CONFIGS = [
 # Monitoring Configuration (defaults, can be overridden per sheet via "check_interval")
 CHECK_INTERVAL = 10  # seconds between sheet checks
 DONE_COLUMN_NAME = "Done?"  # case-insensitive column name to monitor
-SEARCH_COLUMN = "B"  # Column B contains the search string for sales orders
-DATE_COLUMN = "A"  # Column A contains the creation date
+SEARCH_COLUMN = "C"  # Column C contains the search string for sales orders
+DATE_COLUMN = "B"  # Column B contains the creation date
 
 # Row configuration for spreadsheet structure
 ITEM_ID_ROW = 0   # Row 1 (0-indexed) contains item IDs
@@ -418,6 +418,20 @@ def get_new_completed_rows(ctx: SheetContext, current_completed):
 
 
 def get_column_b_value(row_data):
+    """Extract the value from column C (index 2)"""
+    try:
+        data = row_data.get('data', [])
+        if len(data) > 2:
+            return data[2].strip()
+        else:
+            print(f"WARNING: Row {row_data['row_number']} doesn't have a column C value")
+            return None
+    except Exception as e:
+        print(f"ERROR: Error extracting column C value from row {row_data['row_number']}: {e}")
+        return None
+
+
+def get_column_a_value(row_data):
     """Extract the value from column B (index 1)"""
     try:
         data = row_data.get('data', [])
@@ -431,20 +445,6 @@ def get_column_b_value(row_data):
         return None
 
 
-def get_column_a_value(row_data):
-    """Extract the value from column A (index 0)"""
-    try:
-        data = row_data.get('data', [])
-        if len(data) > 0:
-            return data[0].strip()
-        else:
-            print(f"WARNING: Row {row_data['row_number']} doesn't have a column A value")
-            return None
-    except Exception as e:
-        print(f"ERROR: Error extracting column A value from row {row_data['row_number']}: {e}")
-        return None
-
-
 def validate_row_data(row_data):
     """Validate that row data can be processed"""
     try:
@@ -454,18 +454,18 @@ def validate_row_data(row_data):
             print(f"ERROR: No data found for row {row_data['row_number']}")
             return False
 
-        if len(data) < 2:
-            print(f"ERROR: Row {row_data['row_number']} doesn't have enough columns (need at least A and B)")
+        if len(data) < 3:
+            print(f"ERROR: Row {row_data['row_number']} doesn't have enough columns (need at least B and C)")
             return False
 
         column_a_value = get_column_a_value(row_data)
         if not column_a_value:
-            print(f"ERROR: Row {row_data['row_number']} has empty or invalid column A value (date)")
+            print(f"ERROR: Row {row_data['row_number']} has empty or invalid column B value (date)")
             return False
 
         column_b_value = get_column_b_value(row_data)
         if not column_b_value:
-            print(f"ERROR: Row {row_data['row_number']} has empty or invalid column B value")
+            print(f"ERROR: Row {row_data['row_number']} has empty or invalid column C value")
             return False
 
         return True
@@ -549,8 +549,8 @@ def extract_items_from_sheet_data(sheet_data, row_data):
         quantities = row_data.get('data', [])
 
         row_date = None
-        if len(quantities) > 0 and quantities[0]:
-            row_date_str = str(quantities[0]).strip()
+        if len(quantities) > 1 and quantities[1]:
+            row_date_str = str(quantities[1]).strip()
             try:
                 from datetime import datetime
 
@@ -817,8 +817,8 @@ def process_completed_row(ctx: SheetContext, row_data):
         column_a_date = get_column_a_value(row_data)
         column_b_value = get_column_b_value(row_data)
 
-        print(f"  Column A (date): {column_a_date}")
-        print(f"  Column B (property/ID): {column_b_value}")
+        print(f"  Column B (date): {column_a_date}")
+        print(f"  Column C (property/ID): {column_b_value}")
 
         search_components = build_search_string(column_b_value, column_a_date)
         if not search_components or not search_components[0] or not search_components[1]:

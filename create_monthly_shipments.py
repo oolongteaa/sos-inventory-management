@@ -16,14 +16,14 @@ from sos_inventory_integration import sos_api
 # Tunables
 HTTP_RETRIES = 3           # basic retry for transient timeouts
 RETRY_BACKOFF_SECONDS = 3  # linear backoff between retries
-MAX_SHIPMENTS = 10          # create shipments for first N orders
+MAX_SHIPMENTS = 500          # create shipments for first N orders
 
 # Option A configuration (timezone-safe dates)
 LOCAL_TZ_NAME = "America/New_York"
 SEND_AS_DATETIME = True  # send "YYYY-MM-DDT12:00:00-04:00" if True (recommended)
 
 # Number formatting options
-PREFIX = "* "               # e.g., "SHIP-" or "FULF "
+PREFIX = ""               # e.g., "SHIP-" or "FULF "
 MAX_NUMBER_LEN = 21       # hard cap for the final number string (including prefix)
 
 # Month name and common abbreviations we will search for in the Sales Order number
@@ -398,6 +398,7 @@ def build_sales_order_payload_from_original(original_order: dict, new_number: st
     """
     Build a minimal Sales Order payload using info from the original order.
     Includes a single line for Toilet Paper Roll (id=2), non-taxable.
+    Preserves salesRep from the original order if present.
     """
     customer = original_order.get("customer") or {}
     location = original_order.get("location") or {}
@@ -420,6 +421,20 @@ def build_sales_order_payload_from_original(original_order: dict, new_number: st
     else:
         date_iso = f"{nm_year:04d}-{nm_month:02d}-01T12:00:00"
 
+    # Preserve salesRep if available
+    sales_rep = original_order.get("salesRep") or None
+    sales_rep_block = None
+    if isinstance(sales_rep, dict):
+        sr_id = sales_rep.get("id")
+        sr_name = sales_rep.get("name")
+        # Only include if at least one of id/name exists
+        if sr_id or sr_name:
+            sales_rep_block = {}
+            if sr_id:
+                sales_rep_block["id"] = sr_id
+            if sr_name:
+                sales_rep_block["name"] = sr_name
+
     # Build the minimal header and one line per requirements
     payload = {
         "number": new_number,
@@ -431,6 +446,8 @@ def build_sales_order_payload_from_original(original_order: dict, new_number: st
         "customerPO": original_order.get("customerPO") or original_order.get("customerPo") or None,
         "closed": False,
         "archived": False,
+        # NEW: preserve salesRep if present
+        **({"salesRep": sales_rep_block} if sales_rep_block else {}),
         "lines": [
             {
                 "lineNumber": 1,
@@ -569,29 +586,6 @@ def main(year: int, month: int, numbers_csv: str = ""):
                 print(f"  Lines: {len(shipment.get('lines') or [])}")
                 successes += 1
 
-                # After successful shipment: create the next month's Sales Order
-                try:
-                    new_number = build_next_month_so_number(so_number, year, month)
-                    new_so_payload = build_sales_order_payload_from_original(order, new_number, year, month)
-
-                    print("[DEBUG] ===== NEW SALES ORDER PAYLOAD =====")
-                    print(json.dumps(new_so_payload, indent=2, ensure_ascii=False))
-                    print("[DEBUG] ===== END NEW SALES ORDER PAYLOAD =====")
-
-                    so_ok, so_res = create_sales_order(new_so_payload, access_token)
-                    if so_ok:
-                        # Try to format or at least surface the new SO id/number
-                        created_data = so_res.get("data", so_res) if isinstance(so_res, dict) else {}
-                        new_id = created_data.get("id") if isinstance(created_data, dict) else None
-                        new_num = created_data.get("number") if isinstance(created_data, dict) else new_number
-                        print("[SUCCESS] Created new Sales Order for next month.")
-                        print(f"  New SO Number: {new_num}")
-                        print(f"  New SO ID: {new_id}")
-                    else:
-                        print(f"[WARN] Failed to create new Sales Order for next month: {so_res}")
-                except Exception as e_new_so:
-                    print(f"[WARN] Exception while creating next month's Sales Order: {e_new_so}")
-
             else:
                 print(f"[ERROR] Could not create shipment for SO #{so_number}: {result}")
                 failures += 1
@@ -605,7 +599,7 @@ def main(year: int, month: int, numbers_csv: str = ""):
 
 if __name__ == "__main__":
     YEAR = 2025
-    MONTH = 9
+    MONTH = 12
 
     # Extract --numbers early and remove it from argv so legacy parsing doesn't get confused
     numbers_arg = ""
